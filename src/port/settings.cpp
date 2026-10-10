@@ -122,6 +122,8 @@ std::vector<Field> fields() {
         flag("enhancements", "early_poltergust", e.earlyPoltergust),
         flag("enhancements", "early_bogmire", e.earlyBogmire),
         flag("enhancements", "green_toad", e.greenToad),
+        flag("enhancements", "two_player", e.twoPlayer),
+        flag("enhancements", "coop_improvements", e.coopImprovements),
         flag("enhancements", "unused_portrait_models", e.unusedPortraitModels),
         flag("enhancements", "skip_cutscenes", e.skipCutscenes),
         flag("enhancements", "fast_forward_key", e.fastForwardKey),

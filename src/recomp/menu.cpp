@@ -461,6 +461,22 @@ void unusedContentTab() {
             ImGui::SetTooltip("Bogmire uses his unused early model (/model/shadow.szp): longer wings, thinner\n"
                               "hanging flaps, a defined chin and a wavy ghost tail, with its own animations.");
         if (g.a == port::Avail::Yes) pending("next map load");
+        sDirty |= ImGui::Checkbox("2-player mode (unfinished)", &e.twoPlayer);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The game's leftover two-player mode: a second Luigi on controller port 2\n"
+                              "(assign a device to port 2 in Controls). One shared camera while both are\n"
+                              "close in the same room, top/bottom split screen when apart. As the game left\n"
+                              "it: player 2 can't stun ghosts or follow into other rooms, and doors are slow.");
+        if (g.a == port::Avail::Yes) pending("next map load");
+        ImGui::BeginDisabled(!e.twoPlayer);
+        ImGui::Indent();
+        sDirty |= ImGui::Checkbox("Co-op improvements", &e.coopImprovements);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Finishes the 2-player mode for real co-op: player 2 stuns and captures ghosts\n"
+                              "(captures count), follows player 1 through doors and room changes, gets a\n"
+                              "health meter, and the game is over only when both players are down.");
+        ImGui::Unindent();
+        ImGui::EndDisabled();
     }
     ImGui::Separator();
     {

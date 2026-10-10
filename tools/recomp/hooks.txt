@@ -150,3 +150,21 @@ fn_8002D7C8
 fn_8005D984 us pal
 fn_800293A8 us pal
 fn_80029050
+# Unused 2-player mode (src/recomp/coop.cpp, docs/UNUSED_CONTENT.md): the known Action Replay
+# code's instruction patches, all switched on with the mode (the flag and the port-2 pad of the
+# code's boot cave are host code at map setup).
+# 0x800726D8 player creation: players after the first get sGamePad[1] (r13+0x11C) instead of none.
+patch 40 800726D8 800D011C
+# Doors (fn_80079E20): skip the room-blocked check, and treat every locked door as unlockable.
+patch 41 80079EB4 60000000
+patch 42 80079E6C 48000010
+# fn_800B9430 (Luigi +0x792 event-bit test, e.g. <WEAPON>): always true, so player 2 has the
+# Poltergust and Game Boy Horror.
+patch 43 800B943C 3003FFFE
+# fn_8000BB98 (draw one view): view 1 draws the whole scene like view 0 (ghost layer, effects).
+patch 44 8000BBC4 60000000
+patch 45 8000BC24 60000000
+# fn_8003E7B0: the Game Boy Horror overlay is not skipped in 2-player mode.
+patch 46 8003E7D8 60000000
+# fn_80079440 (door touch): a door with no free side still opens (fn_80079E20).
+patch 47 80079574 60000000

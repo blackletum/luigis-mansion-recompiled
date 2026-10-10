@@ -5,6 +5,7 @@
 #include "port/settings.h"
 #include "recomp/hle.h"
 #include "recomp/version.h"
+#include "recomp/coop.h"
 
 #include <dolphin/gx/GXAurora.h>
 
@@ -153,9 +154,10 @@ HLE(fn_8003BE9C) {
 // quad, fn_8000B228) are set here, and the view's draws that follow use them. View 1 is the
 // GBH screen's live 3D view (unused camera mode). View 0 is the main view; it is smaller
 // than the screen while the GBH frame surrounds it (r13+0x200, fn_80010F20), and then
-// follows the centered frame.
+// follows the centered frame. In the unused 2-player mode (coop.cpp) view 1 is player 2's
+// half of the split screen, which spans the full width like view 0.
 HLE(fn_800115F8) {
-    AnchorScope s(c.r[3] == 1 ? 1 : 0);
+    AnchorScope s(c.r[3] == 1 && !coop::active() ? 1 : 0);
     callOriginal(c, "fn_800115F8");
 }
 // Event portrait renderer (<PDEMO>): 3D drawn into its own viewport. During E. Gadd's call

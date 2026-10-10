@@ -20,6 +20,7 @@ u32 viRetraceCount();  // hle_vi.cpp
 namespace {
 
 struct ScriptedPress {
+    int port;  // 0-based; items prefixed "P2:".."P4:" drive the other ports
     u32 start, frames;
     u16 buttons;
     s8 stickX, stickY;
@@ -30,9 +31,14 @@ std::vector<ScriptedPress> parseScript(const std::string& script) {
     std::stringstream ss(script);
     std::string item;
     while (std::getline(ss, item, ',')) {
+        int port = 0;
+        if (item.size() > 3 && (item[0] == 'P' || item[0] == 'p') && item[1] >= '1' && item[1] <= '4' && item[2] == ':') {
+            port = item[1] - '1';
+            item.erase(0, 3);
+        }
         const auto colon = item.find(':');
         if (colon == std::string::npos) continue;
-        ScriptedPress p{u32(std::strtoul(item.c_str(), nullptr, 10)), 6, 0, 0, 0};
+        ScriptedPress p{port, u32(std::strtoul(item.c_str(), nullptr, 10)), 6, 0, 0, 0};
         std::string rest = item.substr(colon + 1);
         if (const auto star = rest.find('*'); star != std::string::npos) {
             p.frames = u32(std::strtoul(rest.c_str() + star + 1, nullptr, 10));
@@ -63,8 +69,20 @@ std::vector<ScriptedPress> parseScript(const std::string& script) {
     return out;
 }
 
-void applyScript(PADStatus& st) {
-    static const std::vector<ScriptedPress> script = parseScript(port::options().inputScript);
+const std::vector<ScriptedPress>& script() {
+    static const std::vector<ScriptedPress> s = parseScript(port::options().inputScript);
+    return s;
+}
+
+// Ports other than 1 that the script drives: they read as connected for the whole run (a pad
+// plugged in), so the game sees the controller even between presses.
+bool scriptUsesPort(int port) {
+    for (const auto& p : script())
+        if (p.port == port) return true;
+    return false;
+}
+
+void applyScript(PADStatus* pads) {
     // LM_INPUT_CLOCK=frames: time the script in guest frames, which do not depend on
     // fast-forward (cutscene skipping) the way retraces do.
     static const bool byFrames = [] {
@@ -72,7 +90,15 @@ void applyScript(PADStatus& st) {
         return v && std::string(v) == "frames";
     }();
     const u32 now = byFrames ? skip::guestFrames() : viRetraceCount();
-    for (const auto& p : script) {
+    for (int i = 1; i < PAD_MAX_CONTROLLERS; i++) {
+        static const bool used[PAD_MAX_CONTROLLERS] = {true, scriptUsesPort(1), scriptUsesPort(2), scriptUsesPort(3)};
+        if (used[i] && pads[i].err != PAD_ERR_NONE) {
+            pads[i] = PADStatus{};
+            pads[i].err = PAD_ERR_NONE;
+        }
+    }
+    for (const auto& p : script()) {
+        PADStatus& st = pads[p.port];
         if (now >= p.start && now < p.start + p.frames) {
             st.button |= p.buttons;
             // The game reads the analog trigger values (vacuum/blow strength), not just the bits.
@@ -136,7 +162,7 @@ HLE(PADRead) {
         }
     }
     if (!port::options().inputScript.empty()) {
-        applyScript(st[0]);
+        applyScript(st);
         static u32 sLogged = 0;
         if (st[0].button && sLogged++ < 20)
             log("[pad] retrace %u frame %u: buttons %04X err %d", viRetraceCount(), skip::guestFrames(), st[0].button, st[0].err);

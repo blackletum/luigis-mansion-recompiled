@@ -10,6 +10,7 @@
 #include "recomp/model_viewer.h"
 #include "recomp/version.h"
 #include "recomp/room_swap.h"
+#include "recomp/coop.h"
 
 #include <imgui.h>
 #include <SDL3/SDL.h>
@@ -183,6 +184,7 @@ HLE(fn_8000C188) {
     sVisit = sArrivalPending;  // reached by a warp: its entry events are held back
     sArrivalPending = false;
     rooms::onMapSetup();
+    coop::onMapSetup(c);  // unused 2-player mode: latched per map (coop.cpp)
     callOriginal(c, "fn_8000C188");
 }
 

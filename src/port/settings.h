@@ -80,6 +80,8 @@ struct EnhancementSettings {
     bool earlyPoltergust = false;       // E3 2001 Poltergust body /model/vbody.szp (src/recomp/unused_models.cpp)
     bool earlyBogmire = false;          // early Bogmire model /model/shadow.szp (src/recomp/unused_models.cpp)
     bool greenToad = false;             // Toads use kinopio2's green texture set (src/recomp/unused_models.cpp)
+    bool twoPlayer = false;             // unused 2-player mode, P2 on controller port 2 (src/recomp/coop.cpp)
+    bool coopImprovements = false;      // co-op fixes on top of the 2-player mode (src/recomp/coop_fixes.cpp)
     bool earlyGhostLighting = false;  // "Ghost shading: Beta" = the known beta-shading cheat (fn_800581E8 channel setup)
     bool skipCutscenes = false;  // START skips cutscenes (src/recomp/skip.cpp)
     bool fastForwardKey = true;  // holding Tab runs the game at high speed (src/recomp/skip.cpp)
