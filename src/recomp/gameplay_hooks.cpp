@@ -3,6 +3,7 @@
 // neutral default, so the original game is untouched unless the player changes something.
 #include "recomp/gameplay.h"
 
+#include "recomp/coop.h"
 #include "recomp/hidden_mansion.h"
 #include "recomp/hle.h"
 #include "recomp/version.h"
@@ -140,6 +141,7 @@ HLE(fn_800B9488) {
             GP_FIRST("damage x%.2f: hit %d -> %d", k, dmg, scaled);
         }
     }
+    if (coop::fixes()) coop::onLuigiHealth(c);  // 2-player co-op: a downed player is revived by the partner
     callOriginal(c, "fn_800B9488");
 }
 
@@ -178,6 +180,7 @@ HLE(fn_800AE1A4) {
 HLE(fn_800C0F08) {
     const u32 self = c.r[3];
     const u32 msg = inMem1(c.r[4]) ? rd32(c.r[4]) : 0;
+    if (coop::active()) coop::onGhostMessage(c);  // 2-player mode: messages from player 2
     callOriginal(c, "fn_800C0F08");
     const float k = current().ghostHealthScale;
     if (k == 1.0f || (msg != 6 && msg != 7)) return;

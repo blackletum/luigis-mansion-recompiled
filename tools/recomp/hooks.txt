@@ -168,3 +168,9 @@ patch 45 8000BC24 60000000
 patch 46 8003E7D8 60000000
 # fn_80079440 (door touch): a door with no free side still opens (fn_80079E20).
 patch 47 80079574 60000000
+# 2-player mode, per-frame work (coop_fixes.cpp): the game-scene view/camera update.
+fn_800112F8
+# Flashlight update (per Luigi): which player's light a ghost message comes from.
+fn_800850B4
+# HUD overlay pass after each view (2-player HUD after both views, player 2's health meter).
+fn_8003E7B0
