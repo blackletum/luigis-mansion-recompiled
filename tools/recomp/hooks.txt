@@ -164,7 +164,7 @@ patch 43 800B943C 3003FFFE
 # fn_8000BB98 (draw one view): view 1 draws the whole scene like view 0 (ghost layer, effects).
 patch 44 8000BBC4 60000000
 patch 45 8000BC24 60000000
-# fn_8003E7B0: the Game Boy Horror overlay is not skipped in 2-player mode.
+# fn_8003E7B0 (HUD after each view): the HUD is not skipped in 2-player mode.
 patch 46 8003E7D8 60000000
 # fn_80079440 (door touch): a door with no free side still opens (fn_80079E20).
 patch 47 80079574 60000000

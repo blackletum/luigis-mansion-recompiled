@@ -466,15 +466,17 @@ void unusedContentTab() {
             ImGui::SetTooltip("The game's leftover two-player mode: a second Luigi on controller port 2\n"
                               "(assign a device to port 2 in Controls). One shared camera while both are\n"
                               "close in the same room, top/bottom split screen when apart. As the game left\n"
-                              "it: player 2 can't stun ghosts or follow into other rooms, and doors are slow.");
+                              "it: player 2 is left behind at doors, has no health meter, and the HUD\n"
+                              "disappears in split screen.");
         if (g.a == port::Avail::Yes) pending("next map load");
         ImGui::BeginDisabled(!e.twoPlayer);
         ImGui::Indent();
         sDirty |= ImGui::Checkbox("Co-op improvements", &e.coopImprovements);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Finishes the 2-player mode for real co-op: player 2 stuns and captures ghosts\n"
-                              "(captures count), follows player 1 through doors and room changes, gets a\n"
-                              "health meter, and the game is over only when both players are down.");
+            ImGui::SetTooltip("Makes the 2-player mode playable as co-op: player 2 is brought along when\n"
+                              "player 1 changes rooms, the HUD stays visible in split screen, player 2 gets\n"
+                              "a health meter, and a downed player is revived with half of the partner's\n"
+                              "health (game over only when both are down).");
         ImGui::Unindent();
         ImGui::EndDisabled();
     }

@@ -173,6 +173,11 @@ lets a module own its own sections of `settings.ini`.
   port 1. Its rumble output is logged (`virtual pad rumble low .. high ..`). This tests
   assignment, hot-plug, default and custom bindings, shaping and rumble without real
   hardware.
+- Scripted input (`--input "600:START*10,1000:A*6"`, `<frame>:<buttons>[*<frames>]`, buttons
+  joined with `+`): items prefixed `P2:` (or `P3:`/`P4:`) drive that port instead of port 1,
+  e.g. `--input "1000:A,P2:2600:STICKLEFT*200,P2:3000:R*60"`. A port the script uses reads as
+  connected for the whole run, so the game sees a pad plugged in (used for the 2-player
+  mode, docs/UNUSED_CONTENT.md).
 - `LM_MENU=Controls` opens the menu on this tab. `LM_CONTROLS_TAB=Ports|Bindings|Analog`
   selects a sub-tab.
 - `LM_CONTROLS_CAPTURE=<keyboard|pad>:<input key>:<1|2>` starts a binding capture when the

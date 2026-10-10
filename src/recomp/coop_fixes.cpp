@@ -64,12 +64,11 @@ void onMapSetupFixes(Ctx&) {
 namespace {
 // Puts player 2 right behind player 1 (facing the same way), e.g. after player 1 went
 // through a door: the game only follows player 1 into the next room.
-void bringP2(Ctx& c, u32 p1, u32 p2) {
+void bringP2(u32 p1, u32 p2) {
     const float fx = gu::rdf(p1 + 0xF48), fz = gu::rdf(p1 + 0xF50);
     gu::wrf(p2 + 0x44, gu::rdf(p1 + 0x44) - fx * 120.0f);
     gu::wrf(p2 + 0x48, gu::rdf(p1 + 0x48));
     gu::wrf(p2 + 0x4C, gu::rdf(p1 + 0x4C) - fz * 120.0f);
-    (void)c;
 }
 }  // namespace
 
@@ -102,7 +101,7 @@ HLE(fn_800112F8) {
         const u32 p1 = player(c, 0), p2 = player(c, 1);
         const u32 r1 = roomOf(0), r2 = roomOf(1);
         if (p1 && p2 && r1 != sLastRoom[0] && sLastRoom[0] != ~0u && r1 != r2) {
-            bringP2(c, p1, p2);
+            bringP2(p1, p2);
             log("[coop] player 1 entered room %u: player 2 (room %u) follows", r1, r2);
         }
         sLastRoom[0] = r1;

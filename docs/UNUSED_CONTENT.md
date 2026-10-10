@@ -413,12 +413,122 @@ on and off; lab with `LM_START_MAP=4`):
 Not checked in game: the retail-only expressions that use the appended eye textures
 (poisoned, `lookheat`) and the burn/ice reactions.
 
+## 2-player mode ("2-player mode (unfinished)", "Co-op improvements")
+
+`src/recomp/coop.cpp` (the mode as the game left it), `src/recomp/coop_fixes.cpp` (the
+improvements and test aids). US code only (`port::usCodeFeature()`), both options off by
+default, and both take effect at the next map load.
+
+### How it works in the retail code
+
+Everything hangs off `Koga::EnManager::sAppearPointSlotIndex` (`0x804D80B0`), the index of the
+last player slot. Nothing writes it (only reads), so it stays 0. With 1:
+- Map setup creates two players: the loop in `fn_80072554` runs `slot + 1` times (at most 4),
+  each with its own nozzle/tank/Game Boy Horror (`fn_800E977C`), its own persistent record
+  (`fn_800739A4(i)` = `lbl_803D5CD0 + 0x16C*i`: health, max health, Poltergust/GBH bits) and
+  its own flashlight (+0x7E0) and Poltergust controller (+0x7E4). Only player 0 gets a pad
+  (`sGamePad`, flag bit 1); later players get none.
+- The camera setup `fn_800204B4` gives view 1 (`lbl_803A4C80[1]`) the same third-person
+  camera as view 0 (`fn_80021844`), following player record 2 (`lbl_803A3CA0 + 0x28`).
+- The per-frame view update `fn_800112F8` fills both player records (position, room) and calls
+  `fn_80011150`: if both players are in the same room and closer than sqrt(600000) ~ 775 units
+  there is one 640x240 view letterboxed at y 100..340; otherwise view 0 is the top half and
+  view 1 the bottom half (two views drawn by the frame loop `fn_8000BCE8`).
+- `fn_8003E7B0` (HUD after each view) skips the whole HUD when the slot index is 1.
+- The flashlight (`fn_800850B4` -> `fn_800859EC`) and the vacuum (`fn_8008487C`) test ghosts in
+  rooms visible in either view (`fn_8001CE1C(room, 0) || (room, 1)`), so their code was written
+  with two players in mind.
+
+The known Action Replay code (US) that turns it on:
+
+| AR line | Effect | Port |
+|---------|--------|------|
+| `044D80B0 00000001` | slot index = 1 | written at every map setup (`fn_8000C188` hook, before the original), so it only changes while no player exists |
+| `04005894 483829CC` + cave at `0x80388260` | replaces the `blr` of the boot pad setup `fn_80005830` with: `new JUTGamePad(port 2)` (0x98 bytes), stored at r13+0x11C = `sGamePad[1]` (`0x804D807C`) | host code at the first map setup with the mode on: the game's own `JUTGamePad` constructor for port 2 run on 0x98 bytes of HLE memory (no game heap is touched, so the retail heap layout is unchanged); the constructor links it into `JUTGamePad::mPadList`, so the game's pad read updates it |
+| `040726D8 800D011C` | player creation: players after the first get `sGamePad[1]` instead of no pad | `patch 40` |
+| `04079EB4 60000000`, `04079E6C 48000010` | door open `fn_80079E20`: skip the room-blocked check, every locked door counts as unlockable | `patch 41`, `patch 42` |
+| `040B943C 3003FFFE` | `fn_800B9430` (Luigi +0x792 event-bit test, e.g. the `<WEAPON>` bits) always true, so player 2 has the Poltergust and the GBH | `patch 43` |
+| `0400BBC4 60000000`, `0400BC24 60000000` | `fn_8000BB98` (draw one view): view 1 draws the whole scene like view 0 (normal actors, ghost layer, effects) instead of only map + direct actors | `patch 44`, `patch 45` |
+| `0403E7D8 60000000` | `fn_8003E7B0`: the HUD is not skipped in 2-player mode | `patch 46` |
+| `04079574 60000000` | door touch `fn_80079440`: a door also opens when `fn_80079780` reports no free side | `patch 47` |
+
+All eight are `tools/recomp/hooks.txt` instruction patches switched with the mode
+(`LM_COOP_PATCHES=<hex mask>` keeps only some of them, bit 0 = patch 40, for testing).
+Patch 43 is the code's own blanket cheat: it also gives player 1 the Poltergust and the Game
+Boy Horror at all times.
+
+### What the unfinished mode looks like (option 1)
+
+Verified in the Nursery and the Mirror Room (frame dumps, `LM_COOP=1`, scripted input on
+both ports):
+- A second Luigi stands next to the first and is driven by controller port 2 (F1 > Controls,
+  assign a device to port 2). Both have their own flashlight beam, Poltergust and nozzle.
+- Close together in one room: one shared view, 640x240 letterboxed in the middle of the
+  screen, HUD below it.
+- Apart (more than ~775 units, or different rooms): top/bottom split screen, top = player 1,
+  bottom = player 2. Each view is 640x240 with the normal camera, so it shows more to the
+  sides than the room geometry covers: at the room's edges the cut wall ends and the black void
+  beyond them are visible (no camera clamp for that aspect). In split screen the HUD
+  disappears (drawn after view 0, then covered by view 1).
+- Player 2's flashlight lights ghosts (message 2 to the ghost AI, attributed per flashlight)
+  and the vacuum's capture test reaches them (messages 1/26); the ghosts mostly attack player 1.
+- Player 2 is not taken along when player 1 goes through a door; player 1's health is the only
+  one on screen, and the game is over when player 1's runs out.
+
+### Co-op improvements (option 2)
+
+- **Player 2 follows player 1 between rooms.** When player 1's room (view record +0xC, top byte)
+  changes and player 2 is somewhere else, player 2 is put 120 units behind player 1 (Luigi
+  +0xF48 = facing). Also covers warps and teleports. Verified: `LM_TELEPORT` into the Mirror Room
+  brings player 2 along (`[coop] player 1 entered room 4: player 2 (room 26) follows`), the
+  room's ghosts appear and fight both.
+- **HUD.** `fn_8003E7B0` is hooked: in split screen the HUD is drawn once after the last view
+  (player 1's health meter moved up by 240 to the bottom of the top half), and player 2 gets
+  the game's own health meter drawn a second time with player 2's health (shared view: next to
+  player 1's; split: bottom left of player 2's half). The meter's globals (`0x804D8490/92`
+  health shown, `0x804D84B0` heartbeat, `0x804D8496/98` digit position, heart sprites
+  `0x803CE698 + 0x30/0x48/0x60` x/y) are swapped in for that call and restored.
+- **Health / game over.** A player whose health would drop to 0 while the partner has more than
+  1 takes half of the partner's health instead (hook on Luigi's health setter `fn_800B9488`);
+  the game's own game over only happens once both are out. Verified in the Mirror Room with
+  `damage_scale=20` (one hit is lethal): player 1 was revived six times from player 2's health
+  (100 -> 50/50 -> ... -> 2/2), both meters following.
+- Doors: with the follow rule player 2 never has to open doors on their own; the AR door
+  patches (41/42/47) stay on.
+
+Not done / not verified:
+- A full capture by player 2 was not reproduced with scripted input (getting a ghost stunned in
+  front of a scripted player is timing-dependent). The capture path is per player (the vacuum
+  check iterates ghosts in rooms visible in either view and starts the capture through the
+  shared capture manager `lbl_804D8BF0 +0x24` with the vacuuming Luigi), and the capture count
+  is global (`fn_800E5784`), so captures by either player count.
+- Player 2's stick is relative to view 0's camera (the creation params pass camera 0 to every
+  player). Both cameras look the same way, so this only matters at room-specific angles.
+- Event scenes, boss arenas and the lab with two players are untested; scripted events move only
+  player 1.
+
+Interplay with the enhancements: the widescreen hook that anchors view 1 as the GBH screen
+(`fn_800115F8`, widescreen.cpp) leaves it full width in 2-player mode; Hor+ widening and the
+widened culling apply to both views (each spans the full width); checked at 21:9 with "Keep HUD
+at 4:3" off (both meters anchored left, the GBH right, both views Hor+). Interpolation was checked with
+`LM_INTERP_TEST` in split screen (both views blend without artefacts). The self-shadow and
+the ghost layer are drawn per view by the game's own code (patches 44/45).
+
+Test aids: `LM_COOP=1`, `LM_COOP_FIXES=1` (force the options), `LM_COOP_DUMP=1` (both players'
+position, health, flags and equipment every 300 frames), `LM_COOP_MSGLOG=1` (messages to ghost
+AI objects, with the player whose flashlight sent message 2), `LM_COOP_GHOST_TEST=<from>,<to>`
+(guest frames: keeps the first visible ghost 220 units in front of player 2, or player 1 with
+`LM_COOP_GHOST_TARGET=1`; `LM_COOP_GHOST_HP0=1` also zeroes its health), and `P2:` items in
+`--input` (docs/CONTROLS.md). Typical run: `LM_COOP=1 LM_COOP_FIXES=1 LM_TEST_STATE=poltergust
+LM_START_MAP=2 LM_START_APPEAR=1 LM_TELEPORT=3380,0,-220,200 LM_SKIP_CUTSCENES=1
+LM_SKIP_AUTO=30 --input "600:START*10,1000:A*6,1500:A,1800:A,2100:A,2400:A,P2:2600:STICKLEFT*500"`
+(Nursery, then the Mirror Room with its ghosts).
+
 ## Other leftovers noticed
 
 - GBH screen mode 1 is the E3 clock (exposed as a toggle); there is no separate gauge screen.
-- `fn_80011150` / `fn_800204B4`'s second branch: a complete two-player split-screen
-  (`sAppearPointSlotIndex__Q24Koga9EnManager == 1`; view 0 top half, view 1 bottom half, each
-  following its own player record in `lbl_803A3CA0`).
+- `fn_80011150` / `fn_800204B4`'s second branch: the two-player split screen, restored as the
+  2-player mode above.
 - Ghost archives (`model/obakeNN.szp`) carry `bti/obamN.bti` (64x64 CMPR ghost portrait) and
   `obamN_kg.bti` (I4 silhouette) plus a `geb/` file. No code references them by name.
 
