@@ -149,7 +149,14 @@ PresentInfo lastPresent();
 namespace detail {  // interp.cpp <-> interp_vtx.cpp
 void vtxBeginTape();
 // Copies are finished: points the tape's array loads at them (moved into `keep`).
-void vtxEndTape(u8* tape, u32 size, std::vector<std::vector<u8>>& keep, u64& snapshotBytes);
+// An array load in the tape pointed at a copy: where its pointer is (tape offset), the copy
+// (index into `keep`), the guest array and its stride, and whether draws read it as f32 x, y, z
+// positions or normals (blended per element between tapes: CPU-deformed meshes, pass 6).
+struct ArrayRef {
+    u32 at, data, guest, stride;
+    bool f32x3;
+};
+void vtxEndTape(u8* tape, u32 size, std::vector<std::vector<u8>>& keep, u64& snapshotBytes, std::vector<ArrayRef>& refs);
 // The tape bytes of the draw just noted (noteDraw): a display list's inlined commands, or an
 // immediate-mode draw from before its setup (drawStart) to after its vertices (drawEnd).
 void drawRange(u32 start, u32 end);

@@ -48,6 +48,8 @@ std::vector<Cmd> sCmds;
 struct Snap {
     u32 guest;
     std::vector<u8> data;
+    u32 stride = 0;
+    bool f32x3 = false;  // read as f32 x, y, z positions/normals by some draw
 };
 std::vector<Snap> sSnaps;
 std::unordered_map<u32, int> sSnapOf;  // guest address -> snapshot (this vertex-cache epoch)
@@ -152,6 +154,16 @@ void scanVertices(int fmt, const u8* v, u32 count, u32 vtxSize) {
                 // (an NBT normal of 9 floats) when the stride is smaller than the element; NBT3
                 // indices may read two strides more (Aurora sizes arrays that way).
                 use(slot, minIdx, maxIdx + 3, 36);
+                // Positions/normals the CPU may rewrite every frame (cloth, skinning): blended
+                // per element between tapes when they are f32 x, y, z (interp.cpp replayPair).
+                if (!sSnapParse && gx::vtxArrayF32x3(fmt, a)) {
+                    const Binding& bd = sBind[slot];
+                    if (bd.cmd >= 0 && sCmds[bd.cmd].snap >= 0) {
+                        Snap& sn = sSnaps[sCmds[bd.cmd].snap];
+                        sn.f32x3 = true;
+                        sn.stride = bd.stride;
+                    }
+                }
             }
         }
         offset += u32(s);
@@ -402,9 +414,10 @@ void vtxBeginTape() {
     }
 }
 
-void vtxEndTape(u8* tape, u32 size, std::vector<std::vector<u8>>& keep, u64& snapshotBytes) {
+void vtxEndTape(u8* tape, u32 size, std::vector<std::vector<u8>>& keep, u64& snapshotBytes, std::vector<ArrayRef>& refs) {
     finishDirect();
     flushPending();
+    refs.clear();
     keep.clear();
     keep.reserve(sSnaps.size());
     snapshotBytes = 0;
@@ -428,6 +441,8 @@ void vtxEndTape(u8* tape, u32 size, std::vector<std::vector<u8>>& keep, u64& sna
             const u32 len = u32(d.size());
             for (int k = 0; k < 8; k++) tape[i + k] = u8(ptr >> (56 - 8 * k));
             for (int k = 0; k < 4; k++) tape[i + 8 + k] = u8(len >> (24 - 8 * k));
+            const Snap& sn = sSnaps[c.snap];
+            if (sn.f32x3 && sn.stride >= 12) refs.push_back({i, u32(c.snap), sn.guest, sn.stride, true});
             break;
         }
     }

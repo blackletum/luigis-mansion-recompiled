@@ -137,6 +137,7 @@ struct Tape {
     std::vector<M34> views;      // camera view matrices the values were noted under
     ShadowLight shadow;
     std::vector<std::vector<u8>> arrays;  // vertex-array copies the tape's array loads point at
+    std::vector<detail::ArrayRef> arrayRefs;  // the loads of f32 x, y, z arrays (blended per element)
     u64 arrayBytes = 0;
     std::vector<std::shared_ptr<const std::vector<u8>>> textures;  // texture/TLUT copies its loads point at
     u64 textureBytes = 0;  // newly copied for this tape
@@ -259,6 +260,7 @@ const char* const sSwarmEnv = std::getenv("LM_INTERP_SWARM") ? std::getenv("LM_I
 const bool sSwarmAny = std::strcmp(sSwarmEnv, "any") == 0 || std::strcmp(sSwarmEnv, "old") == 0;
 const bool sSwarmFades = std::strcmp(sSwarmEnv, "fades") == 0 || std::strcmp(sSwarmEnv, "old") == 0;
 u32 sCrossCamera = 0;  // per replay: values whose partner was drawn under another camera (trace)
+u32 sArrayBlends = 0;  // per replay: vertex arrays blended element by element (trace)
 u32 sSnapKinds[kKinds];
 bool sLogSnaps = false;  // LM_INTERP_TEST + trace: log what one test replay snapped
 u32 sLoggedSnaps[kKinds];
@@ -386,11 +388,15 @@ s32 placingPatch(const Tape& t, Span patches) {
             first = s32(i);
         }
     }
-    return slot0 >= 0 && !sOldPairing ? slot0 : first;
+    if (sOldPairing) return first;
+    // CPU-built vertices place their draw (the matrix is then the camera's, the same for all of them).
+    for (u32 i : patches)
+        if (t.patches[i].kind == Kind::Verts) return s32(i);
+    return slot0 >= 0 ? slot0 : first;
 }
 
-bool bundlePos(const Tape& t, Span patches, float out[3]) {
-    if (const s32 k = placingPatch(t, patches); k >= 0) {
+bool bundlePos(const Tape& t, s32 k, float out[3]) {
+    if (k >= 0) {
         const Patch& p = t.patches[k];
         if (p.kind == Kind::PosMtx) {
             for (int r = 0; r < 3; r++) out[r] = val(t, p, 4 * r + 3);
@@ -426,6 +432,10 @@ struct Bundles {
     std::vector<u64> key;
     std::vector<u64> alt;  // the same with bundleAlt
     std::vector<u64> sig;  // the kinds and sizes of the draw's values (value-by-value pairing when equal)
+    // Per draw: the value that places it (placingPatch), or the one an earlier draw left in the
+    // position matrix slot when it notes none itself (a model's further display lists are drawn
+    // with the matrix loaded for its first: the vase on a table, the panels of a door).
+    std::vector<s32> place;
 };
 Bundles bundlesOf(const Tape& t) {
     Bundles out;
@@ -446,6 +456,7 @@ Bundles bundlesOf(const Tape& t) {
     out.key.resize(n);
     out.alt.resize(n);
     out.sig.resize(n);
+    out.place.assign(n, -1);
     const bool sByLayout = sOldPairing;
     // The tape's main camera (the view most position matrices were noted under): draws placed by a
     // matrix noted under another camera (a shadow or light pass drawn from a light, a reflection)
@@ -468,7 +479,17 @@ Bundles bundlesOf(const Tape& t) {
         }
         out.sig[k] = h;
         const s32 pk = placingPatch(t, out.patches[k]);
-        const u64 cam = !sOldPairing && pk >= 0 && t.patches[pk].kind == Kind::PosMtx && t.patches[pk].view != mainView ? 0xCA3ull << 40 : 0;
+        out.place[k] = pk;
+        if (pk < 0 && k > 0 && !sOldPairing) {
+            bool own = false;  // a draw with a position matrix of its own in another slot is not placed by the earlier one
+            for (u32 i : out.patches[k]) own = own || t.patches[i].kind == Kind::PosMtx || t.patches[i].kind == Kind::Verts;
+            const s32 prev = out.place[k - 1];
+            if (!own && prev >= 0 && t.patches[prev].kind == Kind::PosMtx && k < t.bundlePass.size() &&
+                t.bundlePass[k - 1] == t.bundlePass[k])
+                out.place[k] = prev;
+        }
+        const s32 pl = out.place[k];
+        const u64 cam = !sOldPairing && pl >= 0 && t.patches[pl].kind == Kind::PosMtx && t.patches[pl].view != mainView ? 0xCA3ull << 40 : 0;
         const u64 id = t.bundleIds[k] ^ cam, alt = (k < t.bundleAlt.size() ? t.bundleAlt[k] : t.bundleIds[k]) ^ cam;
         out.key[k] = sByLayout ? mix(id ^ h) : id;
         out.alt[k] = sByLayout ? mix(alt ^ h) : alt;
@@ -670,6 +691,7 @@ void findFades(const Tape& a, Tape& b) {
         const s32 j = b.partner[i];
         const u32 kb = b.patches[i].bundle;
         if (j < 0 || kb >= bPaired.size()) continue;
+        if (!sOldPairing && b.patches[i].kind == Kind::Light) continue;  // lights pair on their own (pairTapes step 3)
         bPaired[kb] = 1;
         const u32 ka = a.patches[j].bundle;
         if (ka < aToB.size() && aToB[ka] < 0) aToB[ka] = s32(kb);
@@ -732,7 +754,7 @@ void pairTapes(const Tape& a, Tape& b) {
         };
         auto where = [](const Tape& t, const Bundles& bs) {
             std::vector<Where> w(bs.patches.size());
-            for (size_t k = 0; k < w.size(); k++) w[k].ok = bundlePos(t, bs.patches[k], w[k].p);
+            for (size_t k = 0; k < w.size(); k++) w[k].ok = bundlePos(t, bs.place[k], w[k].p);
             return w;
         };
         const std::vector<Where> wa = where(a, ba), wb = where(b, bb);
@@ -791,22 +813,28 @@ void pairTapes(const Tape& a, Tape& b) {
                 float d = 0;
                 const auto& pa = ba.patches[i];
                 const auto& pb = bb.patches[j];
-                if (ba.sig[i] == bb.sig[j]) {
-                    for (size_t k = 0; k < pa.size(); k++) d += distance(a, a.patches[pa[k]], b, b.patches[pb[k]]);
-                    return d;
-                }
-                // Instances with other values noted before them (pass 6): where they are and how they
-                // are turned (the first position matrix: world place, view-space rotation), or their
-                // first CPU-built vertices.
-                const s32 ka = placingPatch(a, pa), kb = placingPatch(b, pb);
+                float rest = 0;  // all values compared one by one (equal layouts)
+                if (ba.sig[i] == bb.sig[j])
+                    for (size_t k = 0; k < pa.size(); k++) rest += distance(a, a.patches[pa[k]], b, b.patches[pb[k]]);
+                if (sOldPairing) return rest;
+                // Pass 6: where the draw is and how it is turned decides (the matrix it is drawn with:
+                // world place, view-space rotation; or its first CPU-built vertices). The other values
+                // only break ties: the lights and texture matrices loaded per instance often match
+                // another instance better than the instance's own of the previous frame (lights are
+                // chosen per object and frame), and summed in view space they outweighed a 1000-unit
+                // difference in place: two identical vases swapped every game frame.
+                const s32 ka = ba.place[i], kb = bb.place[j];
                 const Patch* ma = ka >= 0 ? &a.patches[ka] : nullptr;
                 const Patch* mb = kb >= 0 ? &b.patches[kb] : nullptr;
-                if (!ma || !mb || !compatible(*ma, *mb)) return 1e6f;  // nothing to compare: last choice
-                if (ma->kind == Kind::Verts || !wa[i].ok || !wb[j].ok) return distance(a, *ma, b, *mb);
-                for (int c = 0; c < 3; c++) d += std::fabs(wa[i].p[c] - wb[j].p[c]);
-                for (int r = 0; r < 3; r++)
-                    for (int c = 0; c < 3; c++) d += 100.0f * std::fabs(val(a, *ma, 4 * r + c) - val(b, *mb, 4 * r + c));
-                return d;
+                if (!ma || !mb || !compatible(*ma, *mb)) return ba.sig[i] == bb.sig[j] ? rest : 1e6f;  // nothing places them
+                if (ma->kind == Kind::Verts || !wa[i].ok || !wb[j].ok) {
+                    d = distance(a, *ma, b, *mb);
+                } else {
+                    for (int c = 0; c < 3; c++) d += std::fabs(wa[i].p[c] - wb[j].p[c]);
+                    for (int r = 0; r < 3; r++)
+                        for (int c = 0; c < 3; c++) d += 100.0f * std::fabs(val(a, *ma, 4 * r + c) - val(b, *mb, 4 * r + c));
+                }
+                return d + 1e-3f * rest;
             };
             if (many && A.size() * B.size() > 1024) {  // (also the huge ones: thousands of glyph quads in the menus took seconds all-pairs)
                 // Big groups: only draws within the motion limit can pair, so find them through
@@ -825,8 +853,16 @@ void pairTapes(const Tape& a, Tape& b) {
                     if (hi3[c] - lo3[c] > hi3[ax] - lo3[ax]) ax = c;
                 for (u32 i : A) {
                     if (drawUsed[i]) continue;
-                    if (wa[i].ok) byX.emplace_back(pred[i][ax], i);
-                    else nowhereA.push_back(i);
+                    if (!wa[i].ok) {
+                        nowhereA.push_back(i);
+                        continue;
+                    }
+                    byX.emplace_back(pred[i][ax], i);
+                    // Also where the group's common motion carries it (pass 6): a draw paired wrongly
+                    // once carried that wrong motion as its own into the next frame's prediction, and
+                    // static flames kept swapping layers.
+                    if (!sOldPairing && std::fabs(wa[i].p[ax] + common[ax] - pred[i][ax]) > 0.5f)
+                        byX.emplace_back(wa[i].p[ax] + common[ax], i);
                 }
                 std::sort(byX.begin(), byX.end());
                 // Draws of one CPU-built vertex block each (particles): their first vertices
@@ -873,14 +909,23 @@ void pairTapes(const Tape& a, Tape& b) {
                     auto it = std::lower_bound(byX.begin(), byX.end(), std::pair<float, u32>(pb[ax] - lim, 0));
                     for (; it != byX.end() && it->first <= pb[ax] + lim; ++it) {
                         const u32 i = it->second;
-                        float d2 = 0;
+                        float d2 = 0, d2c = 0;
                         for (int c = 0; c < 3; c++) {
-                            const float e = pb[c] - pred[i][c];
-                            d2 += e * e;
+                            const float e = pb[c] - pred[i][c], ec = pb[c] - (wa[i].p[c] + common[c]);
+                            d2 += e * e, d2c += ec * ec;
                         }
+                        if (!sOldPairing) d2 = std::min(d2, d2c);
                         // Ranked by how far from where it was expected (CPU-built particles), or by
                         // all its values (models: orientation too).
-                        if (d2 <= lim * lim) add(vertsOnly ? std::sqrt(d2) : groupDistance(i, j), i, j);
+                        // CPU-built quads also by their shape (pass 6): a candle flame is a few quads of
+                        // different sizes around one point, and by the first corner alone a flame's
+                        // layers swapped (the flame jumped up and down between game frames).
+                        float shape = 0;
+                        if (vertsOnly && !sOldPairing)
+                            for (u32 v = 1; v < nv; v++)
+                                for (int c = 0; c < 3; c++)
+                                    shape += std::fabs((decB[j * 12 + v * 3 + c] - decB[j * 12 + c]) - (decA[i * 12 + v * 3 + c] - decA[i * 12 + c]));
+                        if (d2 <= lim * lim) add(vertsOnly ? std::sqrt(d2) + shape : groupDistance(i, j), i, j);
                     }
                     for (u32 i : nowhereA) add(groupDistance(i, j), i, j);
                 }
@@ -926,7 +971,14 @@ void pairTapes(const Tape& a, Tape& b) {
                         if (d2 > lim * lim) return 1e30f;
                     }
                 }
-                return fullDistance(i, j);
+                // Ties (draws nothing tells apart, e.g. a HUD's identical lamp quads at fixed places
+                // with only their colours differing) go by draw order (pass 6): nearest first among
+                // equals used to pick any of them, swapping the Game Boy Horror's lamps' colours.
+                const float d = fullDistance(i, j);
+                if (sOldPairing) return d;
+                const float ra = float(std::lower_bound(A.begin(), A.end(), i) - A.begin());
+                const float rb = float(std::lower_bound(B.begin(), B.end(), j) - B.begin());
+                return d + 1e-3f * std::fabs(ra - rb);
             }, many && swarm && !sSwarmAny);
         }
         };
@@ -940,6 +992,17 @@ void pairTapes(const Tape& a, Tape& b) {
                 if (drawPartner[k] < 0 && !bb.patches[k].empty()) rb[bb.alt[k]].push_back(k);
             if (!ra.empty() && !rb.empty()) pairGroups(ra, rb);
         }
+        if (drawLogFrame(b.dumpFrame) && b.dumpOffset != ~0u)  // LM_INTERP_DRAWS: the draw pairs
+            for (u32 j = 0; j < bb.key.size(); j++) {
+                if (bb.patches[j].empty()) continue;
+                const s32 i = drawPartner[j];
+                const s32 pj = bb.place[j];
+                log("[draws] f%u draw %u dl %08X key %016llX sig %016llX place #%d at %.0f %.0f %.0f%s -> draw %d%s at %.0f %.0f %.0f%s",
+                    b.dumpFrame, j, j < b.bundleDl.size() ? b.bundleDl[j] : 0u, (unsigned long long)bb.key[j],
+                    (unsigned long long)bb.sig[j], pj, wb[j].p[0], wb[j].p[1], wb[j].p[2], b.bundleSwarm[j] ? " swarm" : "", i,
+                    i >= 0 && ba.sig[i] != bb.sig[j] ? " (other layout)" : "", i >= 0 ? wa[i].p[0] : 0.0f, i >= 0 ? wa[i].p[1] : 0.0f,
+                    i >= 0 ? wa[i].p[2] : 0.0f, i >= 0 && ba.key[i] != bb.key[j] ? " (by content)" : "");
+            }
         b.drawVel.assign(wb.size(), {0, 0, 0});
         b.drawVelOk.assign(wb.size(), 0);
         for (u32 j = 0; j < bb.key.size(); j++) {
@@ -1039,6 +1102,48 @@ void pairTapes(const Tape& a, Tape& b) {
                     usedA[b.partner[j]] = 0;
                     b.partner[j] = -1;
                 }
+        }
+    }
+    // 3. Lights still without a partner (pass 6): a GX light is the same light from frame to frame
+    //    when it is the same light object in the same slot, wherever its draw went. The flashlight's
+    //    light is loaded before many draws; where those draws' partners noted it elsewhere (or not at
+    //    all) it had no partner and was shown as captured, so the lit area jumped at every game frame.
+    //    Partners here are shared (one light of a may serve many loads of b) and do not count as the
+    //    draw being paired (fades).
+    if (!sOldPairing) {
+        std::unordered_map<u64, std::vector<u32>> lightsA;
+        for (u32 i = 0; i < a.patches.size(); i++) {
+            const Patch& q = a.patches[i];
+            if (q.kind == Kind::Light && q.count == 6 && q.role == 0) lightsA[u64(q.source) << 8 | (q.slot & 0xFF)].push_back(i);
+        }
+        const auto worldPos = [](const Tape& t, const Patch& p, f32 out[3]) {
+            f32 v[3];
+            for (int k = 0; k < 3; k++) v[k] = val(t, p, k);
+            if (p.view >= t.views.size()) {
+                std::copy(v, v + 3, out);
+                return;
+            }
+            const M34& V = t.views[p.view];
+            f32 d[3];
+            for (int r = 0; r < 3; r++) d[r] = v[r] - V[4 * r + 3];
+            for (int r = 0; r < 3; r++) out[r] = V[r] * d[0] + V[4 + r] * d[1] + V[8 + r] * d[2];
+        };
+        for (u32 j = 0; j < b.patches.size(); j++) {
+            const Patch& p = b.patches[j];
+            if (b.partner[j] >= 0 || p.kind != Kind::Light || p.count != 6 || p.role != 0) continue;
+            const auto it = lightsA.find(u64(p.source) << 8 | (p.slot & 0xFF));
+            if (it == lightsA.end()) continue;
+            f32 wb[3];
+            worldPos(b, p, wb);
+            s32 best = -1;
+            float bd = 1e30f;
+            for (u32 i : it->second) {
+                f32 w[3];
+                worldPos(a, a.patches[i], w);
+                const float d = std::fabs(w[0] - wb[0]) + std::fabs(w[1] - wb[1]) + std::fabs(w[2] - wb[2]);
+                if (d < bd) bd = d, best = s32(i);
+            }
+            if (best >= 0) b.partner[j] = best;
         }
     }
     b.phaseUs[3] = usSince(tp);
@@ -1259,7 +1364,8 @@ void endTape(u32 retraceCount) {
     const u32 size = sBase + AuroraCaptureEnd();
     std::vector<std::vector<u8>> arrays;
     u64 arrayBytes = 0;
-    detail::vtxEndTape(sScratch.data(), size, arrays, arrayBytes);
+    std::vector<detail::ArrayRef> arrayRefs;
+    detail::vtxEndTape(sScratch.data(), size, arrays, arrayBytes, arrayRefs);
     std::vector<std::shared_ptr<const std::vector<u8>>> textures;
     u64 textureBytes = 0;
     detail::texEndTape(textures, textureBytes);
@@ -1298,6 +1404,7 @@ void endTape(u32 retraceCount) {
     tape->lights = std::move(sLights);
     sLights = {};
     tape->arrays = std::move(arrays);
+    tape->arrayRefs = std::move(arrayRefs);
     tape->arrayBytes = arrayBytes;
     tape->textures = std::move(textures);
     tape->textureBytes = textureBytes;
@@ -1398,6 +1505,7 @@ namespace {
 void pushColor(u32 at, u32 slot, u8 fmt) {
     Patch p{at, 1, Kind::Color, 0, 0, 0, slot};
     p.posOffset = fmt;
+    if (sOrtho) p.role = 2;  // a 2D (HUD) draw's colour: switched at the game frame, not blended
     p.origin = mix(u64(Kind::Color) << 56 ^ u64(slot) << 8 ^ fmt);
     sPatches.push_back(p);
 }
@@ -1972,7 +2080,7 @@ std::unordered_map<u32, std::vector<ProbeLight>> sProbeLights;
 // Builds tape b with its values blended from a toward b (alpha 1 = b as captured) into
 // sReplay and submits it. `dump` redirects the LM_FRAME_DUMP copy (LM_INTERP_TEST).
 void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
-    sCrossCamera = sColorSwitches = sFadeIns = sFadeOuts = sSnapIns = sSnapOuts = 0;
+    sCrossCamera = sArrayBlends = sColorSwitches = sFadeIns = sFadeOuts = sSnapIns = sSnapOuts = 0;
     sReplay.assign(b.bytes.begin(), b.bytes.end());
     if (a && b.pairedWith != a) a = nullptr;  // not consecutive (a tape was dropped): no pairing
     if (a && b.cut) {
@@ -2107,6 +2215,9 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                             const auto rd = [](const u8* s) { return u32(s[0]) << 24 | u32(s[1]) << 16 | u32(s[2]) << 8 | s[3]; };
                 const u32 ca = rd(a->bytes.data() + q.offset), cb = rd(b.bytes.data() + p.offset);
                 u32 out = cb;
+                // 2D (HUD) colours change at the game frame (pass 6): the Game Boy Horror's Boo lamp
+                // blinks red/yellow by colour registers; blended it turned whitish and stopped blinking.
+                const bool hud = p.role == 2 && !sOldPairing;
                 // A channel that jumps by more than 96 levels in one game frame is a switch, not a
                 // fade (a damage or invincibility blink toggling a material's alpha/color, a light
                 // switched on): it changes at the game frame, as on the console (a's value until
@@ -2128,7 +2239,7 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                         if (x & (1 << (bits - 1))) x -= 1 << bits;
                         if (y & (1 << (bits - 1))) y -= 1 << bits;
                     }
-                    const int v = jump > 96 ? x : int(std::lround(float(x) + float(y - x) * alpha));
+                    const int v = jump > 96 || hud ? x : int(std::lround(float(x) + float(y - x) * alpha));
                     out = (out & ~(mask << shift)) | (u32(v) & mask) << shift;
                 };
                 if (p.posOffset == 0) {
@@ -2180,6 +2291,16 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
             if (p.kind == Kind::Light && (p.source != q.source || attnChanged())) {
                 sSnapped++;
                 sSnapKinds[u32(p.kind)]++;
+                if (sLogSnaps && sLoggedSnaps[u32(p.kind)]++ < 16) {
+                    char buf[600];
+                    int n = std::snprintf(buf, sizeof(buf), "[interp]   snap light src %08X>%08X slot %u>%u%s attn:", q.source, p.source,
+                                          q.slot, p.slot, p.source != q.source ? " (other object)" : " (attenuation changed)");
+                    for (int k = 0; k < 6 && p.offset >= 24 && q.offset >= 24; k++)
+                        n += std::snprintf(buf + n, sizeof(buf) - n, " %.4g>%.4g", loadBE(a->bytes.data() + q.offset - 24 + 4 * k),
+                                           loadBE(b.bytes.data() + p.offset - 24 + 4 * k));
+                    n += std::snprintf(buf + n, sizeof(buf) - n, " pos %.0f %.0f %.0f>%.0f %.0f %.0f", va[0], va[1], va[2], vb[0], vb[1], vb[2]);
+                    log("%s", buf);
+                }
                 continue;
             }
             const bool jump2D = p.role == 2 && p.kind == Kind::PosMtx && p.count == 12 &&
@@ -2317,6 +2438,76 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 if (w > 0.002f) fl |= 1u | (std::clamp(u32(w * 255.0f + 0.5f), 1u, 255u) << 8);
                 for (int k = 0; k < 4; k++) out[32 + k] = u8(fl >> (24 - 8 * k));
             }
+        }
+    }
+    // Meshes the CPU rewrites every game frame (cloth: curtains, the shower curtain, tablecloths;
+    // skinned and morphed models) (pass 6): their vertex arrays are copied per tape, and a replay
+    // used b's copy as is, so the mesh's shape stepped at the game rate while everything around it
+    // moved smoothly. f32 x, y, z positions and normals of the same guest array (in the order the
+    // tape loads them) are blended element by element; an element that jumps more than 200 units
+    // keeps b's value, and an array where most do (memory reused for another mesh) is left as is.
+    // LM_INTERP_ARRAYBLEND=0 (test aid) turns it off.
+    static const bool sArrayBlend = [] {
+        const char* v = std::getenv("LM_INTERP_ARRAYBLEND");
+        return !(v && *v == '0');
+    }();
+    if (a && alpha < 1.0f && sArrayBlend && !sOldPairing && !b.arrayRefs.empty() && !a->arrayRefs.empty()) {
+        // Blended copies live until the FIFO has read them (the last several replays).
+        static std::deque<std::vector<std::vector<u8>>> sRing;
+        sRing.emplace_back();
+        while (sRing.size() > 12) sRing.pop_front();
+        auto& set = sRing.back();
+        std::unordered_map<u32, std::vector<const detail::ArrayRef*>> byGuest;
+        for (const auto& r : a->arrayRefs) byGuest[r.guest].push_back(&r);
+        std::unordered_map<u32, u32> seen;               // guest -> loads of it in b so far
+        std::unordered_map<u64, const u8*> made;         // (a copy, b copy) -> blended copy
+        for (const auto& rb : b.arrayRefs) {
+            const u32 nth = seen[rb.guest]++;
+            const auto it = byGuest.find(rb.guest);
+            if (it == byGuest.end() || nth >= it->second.size()) continue;
+            const detail::ArrayRef& ra = *it->second[nth];
+            if (ra.stride != rb.stride || ra.data >= a->arrays.size() || rb.data >= b.arrays.size()) continue;
+            const std::vector<u8>& da = a->arrays[ra.data];
+            const std::vector<u8>& db = b.arrays[rb.data];
+            const u64 key = u64(ra.data) << 32 | rb.data;
+            const u8* ptr = nullptr;
+            if (const auto m = made.find(key); m != made.end()) {
+                ptr = m->second;
+            } else {
+                const size_t n = std::min(da.size(), db.size()) / rb.stride;
+                if (n == 0 || std::memcmp(da.data(), db.data(), n * rb.stride) == 0) {
+                    made.emplace(key, nullptr);
+                    continue;
+                }
+                std::vector<u8> out(db);
+                size_t jumps = 0;
+                for (size_t e = 0; e < n; e++) {
+                    const u8* pa = da.data() + e * rb.stride;
+                    const u8* pb = db.data() + e * rb.stride;
+                    f32 va[3], vb[3];
+                    bool ok = true;
+                    for (int c = 0; c < 3; c++) {
+                        va[c] = loadBE(pa + 4 * c), vb[c] = loadBE(pb + 4 * c);
+                        ok = ok && std::isfinite(va[c]) && std::isfinite(vb[c]) && std::fabs(vb[c] - va[c]) <= 200.0f;
+                    }
+                    if (!ok) {
+                        jumps++;
+                        continue;
+                    }
+                    for (int c = 0; c < 3; c++) storeBE(out.data() + e * rb.stride + 4 * c, va[c] + (vb[c] - va[c]) * alpha);
+                }
+                if (jumps * 2 > n) {
+                    made.emplace(key, nullptr);
+                    continue;
+                }
+                set.push_back(std::move(out));
+                ptr = set.back().data();
+                made.emplace(key, ptr);
+                sArrayBlends++;
+            }
+            if (!ptr || rb.at + 8 > sReplay.size()) continue;
+            const u64 v = u64(reinterpret_cast<uintptr_t>(ptr));
+            for (int k = 0; k < 8; k++) sReplay[rb.at + k] = u8(v >> (56 - 8 * k));
         }
     }
     if (dump && b.dumpOffset != ~0u) {
@@ -2683,7 +2874,11 @@ void probeBetween(const ProbeReplay& pr, std::vector<ProbeRec>& recs) {
             sProbeTotals.noTruth++;
             continue;
         }
-        if (it->second.size() > 8 && best > 5.0f) {
+        // Swarms (particles, CPU-built quads such as flames: many draws of one immediate-mode layout) are
+        // not judged unless the partner is unambiguous: they rise, die and are born, and the nearest
+        // one of the previous frame is often not the same particle.
+        const bool cpuSwarm = (db.bundle >= b.bundleDl.size() || b.bundleDl[db.bundle] == 0) && it->second.size() > 4;
+        if ((it->second.size() > 8 || cpuSwarm) && best > 1.0f) {
             sProbeTotals.skippedSwarm++;
             continue;
         }
@@ -2961,10 +3156,10 @@ bool testReplay() {
                 }
             }
         log("[interp] %s: snapped pos %u nrm %u tex %u proj %u light %u verts %u; unpaired pos %u nrm %u tex %u proj %u "
-            "light %u verts %u fadein %u fadeout %u snapin %u snapout %u colorswitch %u crosscam %u%s",
+            "light %u verts %u fadein %u fadeout %u snapin %u snapout %u colorswitch %u crosscam %u arrays %u%s",
             it.name.c_str(), sSnapKinds[0], sSnapKinds[1], sSnapKinds[2], sSnapKinds[3], sSnapKinds[4], sSnapKinds[5],
             unpaired[0], unpaired[1], unpaired[2], unpaired[3], unpaired[4], unpaired[5], sFadeIns, sFadeOuts,
-            sSnapIns, sSnapOuts, sColorSwitches, sCrossCamera, it.b->cut ? " CUT" : "");
+            sSnapIns, sSnapOuts, sColorSwitches, sCrossCamera, sArrayBlends, it.b->cut ? " CUT" : "");
     }
     sLogSnaps = false;
     efbcopy::applyWritebacks();
@@ -3169,7 +3364,8 @@ void liveFinish() {
                 const float d = std::hypot(p->e1[0] - u.e0[0], p->e1[1] - u.e0[1], p->e1[2] - u.e0[2]);
                 if (d < bd) bd = d, best = p;
             }
-            if (!best || bd > 150.0f || (it->second.size() > 8 && bd > 5.0f)) continue;
+            const bool cpuSwarm = (u.bundle >= b.bundleDl.size() || b.bundleDl[u.bundle] == 0) && it->second.size() > 4;
+            if (!best || bd > 150.0f || ((it->second.size() > 8 || cpuSwarm) && bd > 1.0f)) continue;  // (swarms: see probeBetween)
             sLiveSec.units++;
             f32 s0[2], s1[2], m0[2], m1[2];
             if (!liveScreen(cur.proj, sLivePrev.vb, best->e1, s0) || !liveScreen(cur.proj, sLivePrev.vb, u.e0, s1)) continue;

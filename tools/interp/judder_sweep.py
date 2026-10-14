@@ -100,7 +100,7 @@ def main():
     env = dict(os.environ)
     env.update({
         "APPDATA": appdata, "LM_CARD_DIR": card, "LM_AUDIO": "0", "LM_BACKGROUND": "1",
-        "LM_INPUT_CLOCK": "frames", "LM_START_MAP": str(a.map), "LM_START_APPEAR": "1",
+        "LM_INPUT_CLOCK": "frames", "LM_START_MAP": str(a.map), "LM_START_APPEAR": "6",
         "LM_TEST_STATE": "poltergust", "LM_INTERP_TEST": str(steps),
         "LM_FRAME_DUMP": os.path.join(out, "dump") + f",{a.first},{last}", "LM_FRAME_DUMP_NOWRITE": "0" if a.dumps else "1",
         "LM_INTERP_PROBE": os.path.join(out, "probe.txt"), "LM_INTERP_PROBE_PX": str(a.px),

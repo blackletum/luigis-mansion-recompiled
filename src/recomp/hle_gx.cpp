@@ -406,6 +406,13 @@ ProjMode classifyHeld() {
 
 // Vertex layout for interp's vertex-array tracking (interp_vtx.cpp).
 int gx::vtxAttrSize(int fmt, int attr) { return fmt < GX_MAX_VTXFMT ? attrSize(fmt, attr) : -1; }
+// Whether an indexed position/normal array is read as f32 x, y, z in this format (interp blends such
+// arrays the CPU rewrites every frame: cloth, skinned meshes).
+bool gx::vtxArrayF32x3(int fmt, int attr) {
+    if (fmt >= GX_MAX_VTXFMT || (attr != GX_VA_POS && attr != GX_VA_NRM)) return false;
+    const VatEntry& v = sVat[fmt][attr];
+    return v.type == GX_F32 && (attr == GX_VA_POS ? v.cnt == GX_POS_XYZ : v.cnt == GX_NRM_XYZ);
+}
 // Whether an active TEV stage samples an EFB copy (frame interpolation: such draws don't fade).
 bool gx::samplesCopy() {
     for (u32 s = 0; s < sNumTevStages && s < 16; s++) {

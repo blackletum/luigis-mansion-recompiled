@@ -38,6 +38,7 @@ extern bool g_discardDraws;
 // Current vertex layout (hle_gx shadows): bytes attribute `attr` takes in a vertex of
 // format `fmt` (-1 unknown), and its GXAttrType.
 int vtxAttrSize(int fmt, int attr);
+bool vtxArrayF32x3(int fmt, int attr);
 unsigned char vtxDesc(int attr);
 // An active TEV stage samples an EFB copy.
 bool samplesCopy();
