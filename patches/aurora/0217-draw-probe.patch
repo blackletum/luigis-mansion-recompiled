@@ -1,0 +1,198 @@
+diff --git a/include/dolphin/gx/GXAurora.h b/include/dolphin/gx/GXAurora.h
+index 567fa2b..30813c3 100644
+--- a/include/dolphin/gx/GXAurora.h
++++ b/include/dolphin/gx/GXAurora.h
+@@ -167,6 +167,13 @@ extern "C" {
+ #define GX_AURORA_SET_FADE 0x0063
+ #define GX_AURORA_SET_REPLAY_MASK 0x0064
+ 
++/**
++ * Draw probe (frame-interpolation judder detector, test builds of the game): GX_AURORA_PROBE_TAG,
++ * u32 tag: later draws report this tag to the probe callback (AuroraSetDrawProbe). No effect on
++ * rendering; ignored while no callback is set.
++ */
++#define GX_AURORA_PROBE_TAG 0x0068
++
+ #define GX2_SET_POLYGON_OFFSET 0x1000
+ 
+ 
+@@ -337,6 +344,26 @@ u32 AuroraCapturePos(void);
+ /** Submits captured commands to the FIFO (inside an open frame). */
+ void AuroraReplay(const void* data, u32 size);
+ 
++/**
++ * Draw probe: while a callback is set, every draw the FIFO processes (except masked ones) is
++ * reported with the matrix and projection it is drawn with and its first vertex's position, on
++ * the FIFO thread. For measuring where things land on screen (frame interpolation judder).
++ */
++typedef struct AuroraDrawProbe {
++  u32 tag;          /* the last GX_AURORA_PROBE_TAG */
++  u8 prim, fmt;
++  u16 vtxCount;
++  u8 hasPos;        /* pos is the first vertex's model-space position (else 0,0,0) */
++  u8 fadeQ;
++  u8 _pad[2];
++  f32 mtx[12];      /* position matrix (3x4 row-major) of the first vertex */
++  f32 proj[16];     /* projection (4x4 row-major) */
++  f32 pos[3];
++} AuroraDrawProbe;
++typedef void (*AuroraDrawProbeFn)(const AuroraDrawProbe* probe);
++void AuroraSetDrawProbe(AuroraDrawProbeFn fn);
++void GXSetProbeTagAurora(u32 tag);
++
+ #if __cplusplus
+ }
+ #endif
+diff --git a/lib/dolphin/gx/GXAurora.cpp b/lib/dolphin/gx/GXAurora.cpp
+index 9595d82..4985c94 100644
+--- a/lib/dolphin/gx/GXAurora.cpp
++++ b/lib/dolphin/gx/GXAurora.cpp
+@@ -135,6 +135,11 @@ void GXSetReplayMaskAurora(u8 on) {
+   GX_WRITE_U8(on);
+ }
+ 
++void GXSetProbeTagAurora(u32 tag) {
++  GX_WRITE_AURORA(GX_AURORA_PROBE_TAG);
++  GX_WRITE_U32(tag);
++}
++
+ void GX2SetPolygonOffset(f32 mFrontOffset, f32 mFrontScale, f32 mBackOffset, f32 mBackScale, f32 mClamp) {
+   GX_WRITE_AURORA(GX2_SET_POLYGON_OFFSET);
+   GX_WRITE_F32(mFrontOffset);
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index 322c92a..4c5a2c8 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -1050,6 +1050,99 @@ static void size_dynamic_arrays(GXVtxFmt fmt, const u8* vtx, u16 vtxCount, u32 v
+   }
+ }
+ 
++// Draw probe (GXAurora.h AuroraSetDrawProbe): where each draw is drawn, for judder measurements.
++std::atomic<AuroraDrawProbeFn> sDrawProbe{nullptr};
++u32 sProbeTag = ~0u;
++
++static void probe_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vtx) noexcept {
++  const AuroraDrawProbeFn fn = sDrawProbe.load(std::memory_order_relaxed);
++  if (fn == nullptr || g_gxState.replayMask || vtxCount == 0) {
++    return;
++  }
++  AuroraDrawProbe pr{};
++  pr.tag = sProbeTag;
++  pr.prim = static_cast<u8>(prim);
++  pr.fmt = static_cast<u8>(fmt);
++  pr.vtxCount = vtxCount;
++  pr.fadeQ = g_gxState.fadeQ;
++  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
++  u32 mtxIdx = g_gxState.currentPnMtx;
++  u32 offset = 0;
++  bool posOk = false;
++  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_POS; ++i) {
++    const auto attr = static_cast<GXAttr>(i);
++    const auto& attrFmt = vtxFmt.attrs[i];
++    const auto type = g_gxState.vtxDesc[i];
++    if (type == GX_NONE) {
++      continue;
++    }
++    if (i == GX_VA_PNMTXIDX && type == GX_DIRECT) {
++      mtxIdx = vtx[offset] / 3;
++    }
++    if (i == GX_VA_POS) {
++      const u8* src = nullptr;
++      bool le = false;
++      if (type == GX_DIRECT) {
++        src = vtx + offset;
++      } else {
++        const u32 idx = type == GX_INDEX16 ? (u32(vtx[offset]) << 8 | vtx[offset + 1]) : vtx[offset];
++        const auto& array = g_gxState.arrays[GX_VA_POS];
++        if (array.data != nullptr && (array.size == 0 || idx * array.stride + 12 <= array.size)) {
++          src = static_cast<const u8*>(array.data) + idx * array.stride;
++          le = array.le;
++        }
++      }
++      if (src != nullptr) {
++        const u32 cnt = comp_cnt_count(attr, attrFmt.cnt);
++        const u32 csize = comp_type_size(attr, attrFmt.type);
++        const float scale = attrFmt.type == GX_F32 ? 1.0f : 1.0f / float(1u << attrFmt.frac);
++        for (u32 c = 0; c < cnt && c < 3; ++c) {
++          const u8* p = src + c * csize;
++          u32 raw = 0;
++          for (u32 b = 0; b < csize; ++b) {
++            raw = le ? raw | (u32(p[b]) << (8 * b)) : (raw << 8) | p[b];
++          }
++          float v = 0.0f;
++          switch (attrFmt.type) {
++          case GX_F32: v = std::bit_cast<float>(raw); break;
++          case GX_S16: v = float(static_cast<s16>(raw)) * scale; break;
++          case GX_U16: v = float(static_cast<u16>(raw)) * scale; break;
++          case GX_S8: v = float(static_cast<s8>(raw)) * scale; break;
++          default: v = float(static_cast<u8>(raw)) * scale; break;
++          }
++          pr.pos[c] = v;
++        }
++        posOk = true;
++      }
++      break;
++    }
++    if (type == GX_DIRECT) {
++      offset += comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
++    } else {
++      offset += type == GX_INDEX16 ? 2 : 1;
++    }
++  }
++  pr.hasPos = posOk ? 1 : 0;
++  if (mtxIdx >= MaxPnMtx) {
++    mtxIdx = 0;
++  }
++  const auto& m = g_gxState.pnMtx[mtxIdx].pos;
++  const Vec4<float>* rows[3] = {&m.m0, &m.m1, &m.m2};
++  for (int r = 0; r < 3; ++r) {
++    for (int c = 0; c < 4; ++c) {
++      pr.mtx[4 * r + c] = (*rows[r])[c];
++    }
++  }
++  const auto& P = g_gxState.proj;
++  const Vec4<float>* prow[4] = {&P.m0, &P.m1, &P.m2, &P.m3};
++  for (int r = 0; r < 4; ++r) {
++    for (int c = 0; c < 4; ++c) {
++      pr.proj[4 * r + c] = (*prow[r])[c];
++    }
++  }
++  fn(&pr);
++}
++
+ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& reader) noexcept {
+   ZoneScoped;
+   u32 vtxSize;
+@@ -1061,6 +1154,8 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+   u32 totalVtxBytes = vtxCount * vtxSize;
+   if (totalVtxBytes > reader.remaining())
+     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
++  if (sDrawProbe.load(std::memory_order_relaxed) != nullptr)
++    UNLIKELY { probe_draw(prim, fmt, vtxCount, reader.data() + reader.offset()); }
+ 
+   size_dynamic_arrays(fmt, reader.data() + reader.offset(), vtxCount, vtxSize);
+ 
+@@ -1374,6 +1469,8 @@ void handle_aurora(ByteReader& reader) noexcept {
+     }
+   } else if (subCmd == GX_AURORA_SET_REPLAY_MASK) {
+     g_gxState.replayMask = reader.read<u8>() != 0;
++  } else if (subCmd == GX_AURORA_PROBE_TAG) {
++    sProbeTag = reader.read<u32>();
+   } else if (subCmd == GX_AURORA_DRAW_SIZED) {
+     const u8 cmd = reader.read<u8>();
+     const u32 byteLen = reader.read<u32>();
+@@ -1422,6 +1519,8 @@ void handle_aurora(ByteReader& reader) noexcept {
+     }
+     const u32 totalVtxBytes = vtxCount * vtxSize;
+     const auto vertexData = reader.take(totalVtxBytes);
++    if (sDrawProbe.load(std::memory_order_relaxed) != nullptr)
++      UNLIKELY { probe_draw(prim, fmt, vtxCount, vertexData.data()); }
+     const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
+     if (drawIndexCount != 0) {
+       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, drawIndexCount);
+@@ -1493,3 +1592,5 @@ void clear_draw_cache() noexcept {
+ }
+ 
+ } // namespace aurora::gx::fifo
++
++void AuroraSetDrawProbe(AuroraDrawProbeFn fn) { aurora::gx::fifo::sDrawProbe.store(fn, std::memory_order_relaxed); }

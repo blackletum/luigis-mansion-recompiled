@@ -2,9 +2,11 @@
 #include "recomp/interp.h"
 
 #include "recomp/efb_copy.h"
+#include "recomp/enhanced_lighting.h"
 #include "recomp/gx_bridge.h"
 #include "recomp/hle.h"
 #include "recomp/pacing.h"
+#include "recomp/version.h"
 
 #include <aurora/present_timing.h>
 #include <dolphin/gx/GXAurora.h>
@@ -24,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -109,6 +112,8 @@ struct Tape {
     std::vector<u64> bundleAlt;
     std::vector<std::array<u32, 2>> bundleRange;  // per draw: its tape bytes (~0u: unknown)
     std::vector<u8> bundlePass;                    // per draw: the pass (0 main, 1 shadow casters)
+    std::vector<u32> bundleDl;                     // per draw: display-list guest address (0: immediate)
+    std::vector<u16> bundleDraws;                  // per draw: GX draw commands in it (judder detector)
     // Per draw, bits: 1 an EFB copy is bound as a texture (never faded), 2 drawn in a snap scope
     // (setSnapScope: characters, Luigi): appears/vanishes at the game frame, never faded.
     std::vector<u8> bundleCopy;
@@ -172,6 +177,8 @@ std::vector<u64> sBundleIds;
 std::vector<u64> sBundleAlt;
 std::vector<std::array<u32, 2>> sBundleRange;
 std::vector<u8> sBundlePass;
+std::vector<u32> sBundleDl;
+std::vector<u16> sBundleDraws;
 std::vector<u8> sBundleCopy;
 s32 sOpenDraw = -1;  // immediate-mode draw whose end is not known yet
 std::vector<M34> sViews;
@@ -358,9 +365,33 @@ struct Span {
 
 // Where a draw is (view space): the translation of its first position matrix, or its first
 // CPU-built vertex. False if it has neither.
-bool bundlePos(const Tape& t, Span patches, float out[3]) {
+// The value that places a draw: the position matrix it is drawn with (the last one loaded into
+// GX_PNMTX0 before it; a draw often reloads other objects' matrices first, e.g. the second of two
+// mirrored staircases reloads the first one's matrix, then its own), else its first position
+// matrix, else its first CPU-built vertices. -1 if none.
+// LM_INTERP_GROUPS=layout (test aid): draws paired as before pass 6 (groups keyed by the value
+// layout too, placed by their first value, main and other cameras together), for A/B runs.
+const bool sOldPairing = [] {
+    const char* v = std::getenv("LM_INTERP_GROUPS");
+    return v && std::strcmp(v, "layout") == 0;
+}();
+s32 placingPatch(const Tape& t, Span patches) {
+    s32 first = -1, slot0 = -1;
     for (u32 i : patches) {
         const Patch& p = t.patches[i];
+        if (p.kind == Kind::PosMtx && p.count == 12) {
+            if (first < 0) first = s32(i);
+            if (p.slot == 0) slot0 = s32(i);
+        } else if (p.kind == Kind::Verts && first < 0) {
+            first = s32(i);
+        }
+    }
+    return slot0 >= 0 && !sOldPairing ? slot0 : first;
+}
+
+bool bundlePos(const Tape& t, Span patches, float out[3]) {
+    if (const s32 k = placingPatch(t, patches); k >= 0) {
+        const Patch& p = t.patches[k];
         if (p.kind == Kind::PosMtx) {
             for (int r = 0; r < 3; r++) out[r] = val(t, p, 4 * r + 3);
             // In world space when the camera is known (camera motion is then not a draw's own
@@ -382,13 +413,19 @@ bool bundlePos(const Tape& t, Span patches, float out[3]) {
     return false;
 }
 
-// The values noted for each draw of a tape, keyed by what is drawn and by the kinds and
-// sizes of the values (so two draws are only compared value by value when they line up).
+// The values noted for each draw of a tape, keyed by what is drawn. Draws of one thing are
+// grouped by that alone (pass 6): the kinds and sizes of the values noted before a draw (`sig`)
+// vary between instances of one mesh (a light or texture matrix loaded only before some of them),
+// and keying groups by them put a mesh's instances into different groups from frame to frame, so
+// an instance was paired with another instance of its group (a candelabra blended toward the one
+// across the room, or shown unblended when the two were turned too far apart) while its own
+// partner sat in another group.
 struct Bundles {
     std::vector<u32> flat;     // patch indices, grouped by draw
     std::vector<Span> patches;  // per draw
     std::vector<u64> key;
     std::vector<u64> alt;  // the same with bundleAlt
+    std::vector<u64> sig;  // the kinds and sizes of the draw's values (value-by-value pairing when equal)
 };
 Bundles bundlesOf(const Tape& t) {
     Bundles out;
@@ -408,17 +445,33 @@ Bundles bundlesOf(const Tape& t) {
     out.patches.resize(n);
     out.key.resize(n);
     out.alt.resize(n);
+    out.sig.resize(n);
+    const bool sByLayout = sOldPairing;
+    // The tape's main camera (the view most position matrices were noted under): draws placed by a
+    // matrix noted under another camera (a shadow or light pass drawn from a light, a reflection)
+    // are another thing than the same mesh in the main view, even at the same world place.
+    u16 mainView = 0xFFFF;
+    {
+        std::unordered_map<u16, u32> cnt;
+        for (const Patch& p : t.patches)
+            if (p.kind == Kind::PosMtx && p.role == 0 && p.view < t.views.size()) cnt[p.view]++;
+        u32 best = 0;
+        for (const auto& [v, c] : cnt)
+            if (c > best || (c == best && v < mainView)) best = c, mainView = v;
+    }
     for (size_t k = 0; k < n; k++) {
         out.patches[k] = {out.flat.data() + start[k], start[k + 1] - start[k]};
-        u64 h = t.bundleIds[k], g = k < t.bundleAlt.size() ? t.bundleAlt[k] : h;
+        u64 h = 0x5167;
         for (u32 i : out.patches[k]) {
             const Patch& p = t.patches[i];
-            const u64 sig = u64(p.kind) << 48 | u64(p.count) << 32 | u64(p.stride) << 16 | p.posOffset;
-            h = mix(h ^ sig);
-            g = mix(g ^ sig);
+            h = mix(h ^ (u64(p.kind) << 48 | u64(p.count) << 32 | u64(p.stride) << 16 | p.posOffset));
         }
-        out.key[k] = h;
-        out.alt[k] = g;
+        out.sig[k] = h;
+        const s32 pk = placingPatch(t, out.patches[k]);
+        const u64 cam = !sOldPairing && pk >= 0 && t.patches[pk].kind == Kind::PosMtx && t.patches[pk].view != mainView ? 0xCA3ull << 40 : 0;
+        const u64 id = t.bundleIds[k] ^ cam, alt = (k < t.bundleAlt.size() ? t.bundleAlt[k] : t.bundleIds[k]) ^ cam;
+        out.key[k] = sByLayout ? mix(id ^ h) : id;
+        out.alt[k] = sByLayout ? mix(alt ^ h) : alt;
     }
     return out;
 }
@@ -738,7 +791,21 @@ void pairTapes(const Tape& a, Tape& b) {
                 float d = 0;
                 const auto& pa = ba.patches[i];
                 const auto& pb = bb.patches[j];
-                for (size_t k = 0; k < pa.size(); k++) d += distance(a, a.patches[pa[k]], b, b.patches[pb[k]]);
+                if (ba.sig[i] == bb.sig[j]) {
+                    for (size_t k = 0; k < pa.size(); k++) d += distance(a, a.patches[pa[k]], b, b.patches[pb[k]]);
+                    return d;
+                }
+                // Instances with other values noted before them (pass 6): where they are and how they
+                // are turned (the first position matrix: world place, view-space rotation), or their
+                // first CPU-built vertices.
+                const s32 ka = placingPatch(a, pa), kb = placingPatch(b, pb);
+                const Patch* ma = ka >= 0 ? &a.patches[ka] : nullptr;
+                const Patch* mb = kb >= 0 ? &b.patches[kb] : nullptr;
+                if (!ma || !mb || !compatible(*ma, *mb)) return 1e6f;  // nothing to compare: last choice
+                if (ma->kind == Kind::Verts || !wa[i].ok || !wb[j].ok) return distance(a, *ma, b, *mb);
+                for (int c = 0; c < 3; c++) d += std::fabs(wa[i].p[c] - wb[j].p[c]);
+                for (int r = 0; r < 3; r++)
+                    for (int c = 0; c < 3; c++) d += 100.0f * std::fabs(val(a, *ma, 4 * r + c) - val(b, *mb, 4 * r + c));
                 return d;
             };
             if (many && A.size() * B.size() > 1024) {  // (also the huge ones: thousands of glyph quads in the menus took seconds all-pairs)
@@ -888,7 +955,8 @@ void pairTapes(const Tape& a, Tape& b) {
             // Values in draw order; a skinned model may load its joints in another order the next
             // frame: if a position matrix would then jump, its draw's values of each kind are
             // paired nearest first instead.
-            bool reorder = false;
+            // Another value layout (an instance with other values noted before it): kind by kind.
+            bool reorder = ba.sig[drawPartner[j]] != bb.sig[j];
             for (size_t k = 0; k < pb.size() && !reorder; k++) {
                 const Patch& p = b.patches[pb[k]];
                 if (p.kind != Kind::PosMtx || p.count != 12) continue;
@@ -912,7 +980,11 @@ void pairTapes(const Tape& a, Tape& b) {
             for (size_t x = 0; x < pb.size(); x++)
                 for (size_t y = 0; y < pa.size(); y++)
                     if (compatible(a.patches[pa[y]], b.patches[pb[x]]))
-                        cand.emplace_back(distance(a, a.patches[pa[y]], b, b.patches[pb[x]]), pa[y], pb[x]);
+                        cand.emplace_back(distance(a, a.patches[pa[y]], b, b.patches[pb[x]]) +
+                                              (b.patches[pb[x]].kind == Kind::Light && a.patches[pa[y]].slot != b.patches[pb[x]].slot
+                                                   ? 1e5f  // a light: the same GX light slot first
+                                                   : 0.0f),
+                                          pa[y], pb[x]);
             std::sort(cand.begin(), cand.end());
             for (const auto& [d, ia, ib] : cand)
                 if (!usedA[ia] && b.partner[ib] < 0) {
@@ -1167,6 +1239,8 @@ void beginTape() {
     sBundleAlt.clear();
     sBundleRange.clear();
     sBundlePass.clear();
+    sBundleDl.clear();
+    sBundleDraws.clear();
     sBundleCopy.clear();
     sOpenDraw = -1;
     sViews.clear();
@@ -1212,6 +1286,10 @@ void endTape(u32 retraceCount) {
     sBundleRange = {};
     tape->bundlePass = std::move(sBundlePass);
     sBundlePass = {};
+    tape->bundleDl = std::move(sBundleDl);
+    sBundleDl = {};
+    tape->bundleDraws = std::move(sBundleDraws);
+    sBundleDraws = {};
     tape->bundleCopy = std::move(sBundleCopy);
     sBundleCopy = {};
     tape->views = std::move(sViews);
@@ -1383,6 +1461,8 @@ void detail::noteDraw(u64 id) {
     sBundleAlt.push_back(id);
     sBundleRange.push_back({~0u, ~0u});
     sBundlePass.push_back(u8(sPass));
+    sBundleDl.push_back(0);
+    sBundleDraws.push_back(0);
     // Draws sampling an EFB copy (screen effects redrawing the frame, the GBH screen) never fade.
     sBundleCopy.push_back(u8((gx::samplesCopy() ? 1 : 0) | (sSnapScope > 0 ? 2 : 0)));
     sOpenDraw = -1;
@@ -1393,6 +1473,14 @@ void detail::noteDraw(u64 id) {
         p.bundle = bundle;
     }
     sUngrouped = u32(sPatches.size());
+}
+
+void detail::countDraw() {
+    if (capturing() && !sBundleDraws.empty() && sBundleDraws.back() < 0xFFFF) sBundleDraws.back()++;
+}
+
+void detail::noteDrawDl(u32 guestAddr) {
+    if (capturing() && !sBundleDl.empty()) sBundleDl.back() = guestAddr;
 }
 
 void detail::noteDrawAlt(u64 alt) {
@@ -1411,6 +1499,8 @@ void detail::noteVertices(u32 at, u32 count, u32 stride, u32 posOffset, u64 id) 
         sBundleAlt.push_back(id);
         sBundleRange.push_back({~0u, ~0u});
         sBundlePass.push_back(u8(sPass));
+        sBundleDl.push_back(0);
+        sBundleDraws.push_back(0);
         sBundleCopy.push_back(u8((gx::samplesCopy() ? 1 : 0) | (sSnapScope > 0 ? 2 : 0)));
     }
     p.bundle = u32(sBundleIds.size() - 1);
@@ -1869,6 +1959,16 @@ bool buildFades(const Tape& a, const Tape& b, float alpha, bool haveAStart, cons
     return true;
 }
 
+bool sProbeBundleTags = false;  // replayPair: tag every draw with its bundle (judder detector, fresh replays)
+u32 sProbeCurId = 0;
+void probeTagBundles(const Tape& b, std::vector<u8>& buf, u32 id);
+// Judder detector: the light values (position, direction; view space) each in-between replay used.
+struct ProbeLight {
+    u32 patch;
+    f32 v[6];
+};
+std::unordered_map<u32, std::vector<ProbeLight>> sProbeLights;
+
 // Builds tape b with its values blended from a toward b (alpha 1 = b as captured) into
 // sReplay and submits it. `dump` redirects the LM_FRAME_DUMP copy (LM_INTERP_TEST).
 void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
@@ -2244,6 +2344,18 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
     // previous frame's copies that this frame's early draws may still read (Aurora patch 0028).
     // Only the first replay of a tape reads its copies back into memory (bit 6 on the others).
     GXSetCopyGenerationAurora(u8((b.seq & 3) | 0x80 | (b.replayed.exchange(true) ? 0x40 : 0)));
+    if (sProbeBundleTags && !faded) probeTagBundles(b, sReplay, sProbeCurId);
+    if (sProbeCurId && a && alpha < 1.0f) {
+        auto& pl = sProbeLights[sProbeCurId];
+        pl.clear();
+        for (u32 i = 0; i < b.patches.size(); i++) {
+            const Patch& p = b.patches[i];
+            if (p.kind != Kind::Light || p.count != 6 || p.role != 0) continue;
+            ProbeLight l{i, {}};
+            for (int k = 0; k < 6; k++) l.v[k] = loadBE(sReplay.data() + p.offset + 4 * k);
+            pl.push_back(l);
+        }
+    }
     if (faded) AuroraReplay(sFaded.data(), u32(sFaded.size()));
     else AuroraReplay(sReplay.data(), u32(sReplay.size()));
     GXSaveStateAurora(u8(b.seq & 3));
@@ -2320,7 +2432,458 @@ void diagnoseMatching(const Tape& t0, const Tape& t1, const Tape& t2) {
         kinds[5], verts, bbTotal, bbTracked, bbJerky);
 }
 
+// --- judder detector (LM_INTERP_TEST + LM_INTERP_PROBE=<file>; docs/INTERPOLATION.md "Pass 6") ---
+// Aurora reports every draw it processes with the position matrix, projection and first vertex it
+// is drawn with (AuroraSetDrawProbe). Fresh replays (a tape as captured) give each draw's world
+// position under its tape's main camera; every in-between replay is then checked draw by draw:
+// where the draw lands on screen against where it should land: its world position blended
+// linearly between its two game frames (its true partner in the previous tape: the draw of the
+// same display list nearest in world space), seen through the linearly blended camera and
+// projection. Draws off by more than a threshold (pixels at a 2160-line picture) are logged with
+// the likely cause class; the same for draws interpolation paired with another instance.
+struct ProbeRec {
+    u32 tag;
+    u8 prim, fmt;
+    u16 n;
+    bool hasPos;
+    f32 mtx[12], proj[16], pos[3];
+};
+FILE* const sProbeOut = [] {
+    const char* p = std::getenv("LM_INTERP_PROBE");
+    return p && *p ? std::fopen(p, "w") : nullptr;
+}();
+const float sProbeThresh = [] {
+    const char* v = std::getenv("LM_INTERP_PROBE_PX");
+    return v ? float(std::atof(v)) : 1.0f;
+}();
+std::mutex sProbeM;
+std::vector<ProbeRec> sProbeIn;
+void probeCallback(const AuroraDrawProbe* p) {
+    ProbeRec r;
+    r.tag = p->tag, r.prim = p->prim, r.fmt = p->fmt, r.n = p->vtxCount, r.hasPos = p->hasPos != 0;
+    std::memcpy(r.mtx, p->mtx, sizeof(r.mtx));
+    std::memcpy(r.proj, p->proj, sizeof(r.proj));
+    std::memcpy(r.pos, p->pos, sizeof(r.pos));
+    std::lock_guard lk(sProbeM);
+    sProbeIn.push_back(r);
+}
+struct ProbeReplay {
+    u32 id;
+    std::shared_ptr<const Tape> a, b;
+    float alpha;
+    bool fresh;
+};
+std::deque<ProbeReplay> sProbeIssued;
+u32 sProbeNextId = 1;
+struct FreshDraw {
+    ProbeRec r;
+    u32 bundle;
+    u16 sub;
+    bool worldOk = false, scrOk = false;
+    f32 world[3], scr[2];
+};
+struct FreshTape {
+    u64 seq = 0;
+    std::vector<FreshDraw> draws;
+    s32 mainProj = -1;  // index of a draw with the main projection
+};
+std::deque<FreshTape> sFresh;
+struct ProbeTotals {
+    u64 replays = 0, judged = 0, flagged = 0, wrongPairs = 0, skippedSwarm = 0, noTruth = 0, mismatched = 0, lights = 0,
+        lightsFlagged = 0;
+    u64 cause[8] = {};
+} sProbeTotals;
+const char* const kCauseName[8] = {"unpaired", "snapped", "not-noted", "wrong-pair", "cross-camera", "blend", "other", "?"};
+
+u16 mainViewOf(const Tape& t) {
+    std::unordered_map<u16, u32> n;
+    for (const Patch& p : t.patches)
+        if (p.kind == Kind::PosMtx && p.role == 0 && p.view < t.views.size()) n[p.view]++;
+    u16 best = 0xFFFF;
+    u32 cnt = 0;
+    for (const auto& [v, c] : n)
+        if (c > cnt || (c == cnt && v < best)) best = v, cnt = c;
+    return best;
+}
+bool perspective(const f32* P) { return P[14] == -1.0f && P[15] == 0.0f; }
+// Screen position in pixels of a 2160-line picture (x scaled by the projection's aspect).
+bool project(const f32* P, const f32 v[3], f32 out[2]) {
+    const f32 x = P[0] * v[0] + P[1] * v[1] + P[2] * v[2] + P[3];
+    const f32 y = P[4] * v[0] + P[5] * v[1] + P[6] * v[2] + P[7];
+    const f32 w = P[12] * v[0] + P[13] * v[1] + P[14] * v[2] + P[15];
+    if (!(w > 1.0f) || !std::isfinite(x) || !std::isfinite(y)) return false;
+    const f32 aspect = P[0] != 0.0f ? P[5] / P[0] : 1.0f;
+    out[0] = x / w * 1080.0f * aspect;
+    out[1] = y / w * 1080.0f;
+    return std::fabs(out[0]) < 1.3f * 1080.0f * aspect && std::fabs(out[1]) < 1.3f * 1080.0f;
+}
+void xform34(const f32* m, const f32 v[3], f32 o[3]) {
+    for (int r = 0; r < 3; r++) o[r] = m[4 * r] * v[0] + m[4 * r + 1] * v[1] + m[4 * r + 2] * v[2] + m[4 * r + 3];
+}
+// The ideal in-between camera: rotation slerped, eye moved linearly.
+bool idealCamera(const M34& va, const M34& vb, float alpha, M34& out) {
+    M34 ra = va, rb = vb;
+    ra[3] = ra[7] = ra[11] = rb[3] = rb[7] = rb[11] = 0;
+    if (!blendRigid(ra.data(), rb.data(), 4, alpha, out.data())) return false;
+    f32 ea[3], eb[3], e[3];
+    for (int c = 0; c < 3; c++) {
+        ea[c] = -(va[c] * va[3] + va[4 + c] * va[7] + va[8 + c] * va[11]);
+        eb[c] = -(vb[c] * vb[3] + vb[4 + c] * vb[7] + vb[8 + c] * vb[11]);
+        e[c] = ea[c] + (eb[c] - ea[c]) * alpha;
+    }
+    for (int r = 0; r < 3; r++) out[4 * r + 3] = -(out[4 * r] * e[0] + out[4 * r + 1] * e[1] + out[4 * r + 2] * e[2]);
+    return true;
+}
+const FreshTape* freshOf(u64 seq) {
+    for (const FreshTape& f : sFresh)
+        if (f.seq == seq) return &f;
+    return nullptr;
+}
+// The noted position matrix of tape t whose values are `m` (the one a draw was drawn with), or -1.
+s32 patchOfMatrix(const Tape& t, const std::unordered_multimap<u64, u32>& idx, const f32* m) {
+    u64 h = 0;
+    for (int k = 0; k < 12; k++) h = mix(h ^ std::bit_cast<u32>(m[k]));
+    auto [lo, hi] = idx.equal_range(h);
+    for (auto it = lo; it != hi; ++it) {
+        bool same = true;
+        for (int k = 0; k < 12 && same; k++) same = val(t, t.patches[it->second], k) == m[k];
+        if (same) return s32(it->second);
+    }
+    return -1;
+}
+void matrixIndex(const Tape& t, std::unordered_multimap<u64, u32>& idx) {
+    idx.clear();
+    for (u32 i = 0; i < t.patches.size(); i++) {
+        const Patch& p = t.patches[i];
+        if (p.kind != Kind::PosMtx || p.count != 12) continue;
+        u64 h = 0;
+        for (int k = 0; k < 12; k++) h = mix(h ^ std::bit_cast<u32>(val(t, p, k)));
+        idx.emplace(h, i);
+    }
+}
+
+void probeFresh(const ProbeReplay& pr, std::vector<ProbeRec>& recs) {
+    const Tape& t = *pr.b;
+    FreshTape ft;
+    ft.seq = t.seq;
+    const u16 mv = mainViewOf(t);
+    M34 inv{};
+    const bool invOk = mv < t.views.size() && invertAffine(t.views[mv].data(), inv.data());
+    // The main projection: the most common perspective projection among draws of the main pass.
+    std::unordered_map<u64, std::pair<u32, s32>> projCount;
+    static std::unordered_multimap<u64, u32> idx;
+    matrixIndex(t, idx);
+    u32 lastBundle = ~0u;
+    u16 sub = 0;
+    for (const ProbeRec& r : recs) {
+        FreshDraw d{r, r.tag & 0xFFFFF, 0};
+        // Drawn with a matrix noted under another camera (a light's shadow or depth pass, a
+        // reflection): its world place is not under the main camera; not judged.
+        const s32 pm = patchOfMatrix(t, idx, r.mtx);
+        const bool otherCam = pm >= 0 && t.patches[pm].view != mv && t.patches[pm].view != 0xFFFF;
+        if (d.bundle == lastBundle) sub++;
+        else sub = 0, lastBundle = d.bundle;
+        d.sub = sub;
+        if (invOk && perspective(r.proj) && r.hasPos && !otherCam) {
+            f32 v[3];
+            xform34(r.mtx, r.pos, v);
+            xform34(inv.data(), v, d.world);
+            d.worldOk = std::isfinite(d.world[0]) && std::isfinite(d.world[1]) && std::isfinite(d.world[2]);
+            d.scrOk = project(r.proj, v, d.scr);
+            u64 h = 0;
+            for (int k = 0; k < 16; k++) h = mix(h ^ std::bit_cast<u32>(r.proj[k]));
+            auto& pc = projCount[h];
+            pc.first++;
+            pc.second = s32(ft.draws.size());
+        }
+        ft.draws.push_back(d);
+    }
+    u32 best = 0;
+    for (const auto& [h, c] : projCount)
+        if (c.first > best) best = c.first, ft.mainProj = c.second;
+    // (A test replay is repeated until its dump arrives: keep one entry per tape.)
+    for (FreshTape& f : sFresh)
+        if (f.seq == ft.seq) {
+            f = std::move(ft);
+            return;
+        }
+    sFresh.push_back(std::move(ft));
+    while (sFresh.size() > 6) sFresh.pop_front();
+}
+
+void probeBetween(const ProbeReplay& pr, std::vector<ProbeRec>& recs) {
+    const Tape& b = *pr.b;
+    const Tape* a = pr.a.get();
+    const FreshTape* fb = freshOf(b.seq);
+    const FreshTape* fa = a ? freshOf(a->seq) : nullptr;
+    if (!a || !fb || !fa || b.pairedWith != a || b.cut || fb->mainProj < 0 || fa->mainProj < 0) {
+        static u32 sSkips = 0;
+        if (sSkips++ % 40 == 0)
+            log("[probe] in-between f%u skipped: a %d fresh b %d fresh a %d paired %d cut %d proj %d/%d (seq a %llu b %llu, fresh %zu: %llu..%llu)",
+                b.dumpFrame, a != nullptr, fb != nullptr, fa != nullptr, a && b.pairedWith == a, int(b.cut), fb ? fb->mainProj : -9,
+                fa ? fa->mainProj : -9, a ? (unsigned long long)a->seq : 0ull, (unsigned long long)b.seq, sFresh.size(),
+                sFresh.empty() ? 0ull : (unsigned long long)sFresh.front().seq, sFresh.empty() ? 0ull : (unsigned long long)sFresh.back().seq);
+        return;
+    }
+    sProbeTotals.replays++;
+    if (recs.size() != fb->draws.size()) {
+        sProbeTotals.mismatched++;
+        std::fprintf(sProbeOut, "M %u %.3f draws %zu fresh %zu\n", b.dumpFrame, pr.alpha, recs.size(), fb->draws.size());
+        return;
+    }
+    const u16 mva = mainViewOf(*a), mvb = mainViewOf(b);
+    if (mva >= a->views.size() || mvb >= b.views.size()) return;
+    M34 vt;
+    if (!idealCamera(a->views[mva], b.views[mvb], pr.alpha, vt)) return;
+    const f32* Pa = fa->draws[fa->mainProj].r.proj;
+    const f32* Pb = fb->draws[fb->mainProj].r.proj;
+    f32 Pt[16];
+    for (int k = 0; k < 16; k++) Pt[k] = Pa[k] + (Pb[k] - Pa[k]) * pr.alpha;
+    M34 ia;
+    if (!invertAffine(a->views[mva].data(), ia.data())) return;
+    // a's fresh draws by (display list identity, index within the draw).
+    static std::unordered_map<u64, std::vector<u32>> byId;
+    byId.clear();
+    for (u32 k = 0; k < fa->draws.size(); k++) {
+        const FreshDraw& d = fa->draws[k];
+        if (!d.worldOk || d.bundle >= a->bundleIds.size()) continue;
+        byId[mix(a->bundleIds[d.bundle] ^ u64(d.sub) << 48)].push_back(k);
+    }
+    static std::unordered_multimap<u64, u32> idxA, idxB;
+    matrixIndex(*a, idxA);
+    matrixIndex(b, idxB);
+    u32 judged = 0, flagged = 0;
+    float maxErr = 0;
+    for (u32 k = 0; k < recs.size(); k++) {
+        const FreshDraw& db = fb->draws[k];
+        const ProbeRec& r = recs[k];
+        if (r.prim != db.r.prim || r.n != db.r.n) {
+            sProbeTotals.mismatched++;
+            return;
+        }
+        if (!db.worldOk || !db.scrOk || db.bundle >= b.bundleIds.size()) continue;
+        if (std::memcmp(db.r.proj, Pb, sizeof(f32) * 16) != 0) continue;  // not the main camera's pass
+        if (db.bundle < b.bundlePass.size() && b.bundlePass[db.bundle] != 0) continue;
+        const auto it = byId.find(mix(b.bundleIds[db.bundle] ^ u64(db.sub) << 48));
+        if (it == byId.end()) {
+            sProbeTotals.noTruth++;
+            continue;
+        }
+        // The true partner: nearest in world space (a swarm needs an unambiguous one).
+        u32 bestK = ~0u;
+        float best = 1e30f;
+        for (u32 ka : it->second) {
+            const float* w = fa->draws[ka].world;
+            const float d2 = (w[0] - db.world[0]) * (w[0] - db.world[0]) + (w[1] - db.world[1]) * (w[1] - db.world[1]) +
+                             (w[2] - db.world[2]) * (w[2] - db.world[2]);
+            if (d2 < best) best = d2, bestK = ka;
+        }
+        best = std::sqrt(best);
+        if (best > 120.0f) {
+            sProbeTotals.noTruth++;
+            continue;
+        }
+        if (it->second.size() > 8 && best > 5.0f) {
+            sProbeTotals.skippedSwarm++;
+            continue;
+        }
+        const FreshDraw& da = fa->draws[bestK];
+        f32 wt[3], vtw[3], ideal[2], actual[2], v[3];
+        for (int c = 0; c < 3; c++) wt[c] = da.world[c] + (db.world[c] - da.world[c]) * pr.alpha;
+        xform34(vt.data(), wt, vtw);
+        if (!project(Pt, vtw, ideal) || !r.hasPos) continue;
+        xform34(r.mtx, r.pos, v);
+        if (!project(r.proj, v, actual)) continue;
+        judged++;
+        const float err = std::hypot(actual[0] - ideal[0], actual[1] - ideal[1]);
+        const float step = std::hypot(db.scr[0] - da.scr[0], db.scr[1] - da.scr[1]);
+        // Interpolation's own partner for the matrix this draw used.
+        const s32 pi = patchOfMatrix(b, idxB, db.r.mtx);
+        s32 qa = pi >= 0 && !b.partner.empty() ? b.partner[pi] : -1;
+        float pairOff = -1;
+        if (qa >= 0) {
+            const Patch& q = a->patches[qa];
+            f32 m[12], vv[3], w[3];
+            for (int e = 0; e < 12; e++) m[e] = val(*a, q, e);
+            xform34(m, da.r.pos, vv);
+            const M34* va = q.view < a->views.size() ? &a->views[q.view] : nullptr;
+            M34 iq;
+            if (va && invertAffine(va->data(), iq.data())) {
+                xform34(iq.data(), vv, w);
+                pairOff = std::sqrt((w[0] - da.world[0]) * (w[0] - da.world[0]) + (w[1] - da.world[1]) * (w[1] - da.world[1]) +
+                                    (w[2] - da.world[2]) * (w[2] - da.world[2]));
+            }
+        }
+        const bool wrongPair = pairOff > 5.0f;
+        sProbeTotals.wrongPairs += wrongPair;
+        if (err <= sProbeThresh) continue;
+        flagged++;
+        maxErr = std::max(maxErr, err);
+        const bool unblended = std::memcmp(r.mtx, db.r.mtx, sizeof(r.mtx)) == 0;
+        int cause;
+        if (pi < 0) cause = unblended ? 2 : 6;
+        else if (qa < 0) cause = 0;
+        else if (wrongPair) cause = 3;
+        else if (unblended) cause = 1;
+        else if (b.patches[pi].view != mvb) cause = 4;
+        else cause = 5;
+        sProbeTotals.cause[cause]++;
+        const u32 room = u32(enh::roomAt(db.world) + 1);
+        std::fprintf(sProbeOut,
+                     "J %u %.3f %s %.2f %.2f %u %016llX %08X %u %.0f %.0f %.0f %d %.1f %d act %.0f %.0f ideal %.0f %.0f a %.0f %.0f b %.0f %.0f awld %.0f %.0f %.0f\n",
+                     b.dumpFrame, pr.alpha, kCauseName[cause], err, step, db.bundle, (unsigned long long)b.bundleIds[db.bundle],
+                     db.bundle < b.bundleDl.size() ? b.bundleDl[db.bundle] : 0u, db.sub, db.world[0], db.world[1], db.world[2],
+                     int(room) - 1, pairOff, pi >= 0 ? int(b.patches[pi].view) - int(mvb) : -99, actual[0], actual[1], ideal[0],
+                     ideal[1], da.scr[0], da.scr[1], db.scr[0], db.scr[1], da.world[0], da.world[1], da.world[2]);
+    }
+    sProbeTotals.judged += judged;
+    sProbeTotals.flagged += flagged;
+    // GX lights (the flashlight's lit area): position and direction against the linear blend of the
+    // same light object's world position and direction, under the ideal camera.
+    if (auto lit = sProbeLights.find(pr.id); lit != sProbeLights.end()) {
+        const auto world = [](const Tape& t, const Patch& p, const f32* v, f32 pos[3], f32 dir[3]) {
+            if (p.view >= t.views.size()) return false;
+            const M34& V = t.views[p.view];
+            M34 inv;
+            if (!invertAffine(V.data(), inv.data())) return false;
+            xform34(inv.data(), v, pos);
+            for (int r = 0; r < 3; r++) dir[r] = V[r] * v[3] + V[4 + r] * v[4] + V[8 + r] * v[5];
+            return std::isfinite(pos[0] + pos[1] + pos[2] + dir[0] + dir[1] + dir[2]);
+        };
+        for (const ProbeLight& l : lit->second) {
+            const Patch& p = b.patches[l.patch];
+            f32 vb[6], wb[3], db_[3];
+            for (int k = 0; k < 6; k++) vb[k] = val(b, p, k);
+            if (!world(b, p, vb, wb, db_)) continue;
+            // The same light object in a, nearest.
+            s32 best = -1;
+            float bd = 1e30f;
+            f32 wa[3], da_[3];
+            for (u32 j = 0; j < a->patches.size(); j++) {
+                const Patch& q = a->patches[j];
+                if (q.kind != Kind::Light || q.count != 6 || q.role != 0 || q.source != p.source || q.slot != p.slot) continue;
+                f32 va[6], w[3], d[3];
+                for (int k = 0; k < 6; k++) va[k] = val(*a, q, k);
+                if (!world(*a, q, va, w, d)) continue;
+                const float dd = std::hypot(w[0] - wb[0], w[1] - wb[1], w[2] - wb[2]);
+                if (dd < bd) bd = dd, best = s32(j), std::copy(w, w + 3, wa), std::copy(d, d + 3, da_);
+            }
+            if (best < 0 || bd > 150.0f) continue;
+            const Patch& q = a->patches[best];
+            M34 vt2;
+            if (q.view >= a->views.size() || !idealCamera(a->views[q.view], b.views[p.view], pr.alpha, vt2)) continue;
+            f32 w[3], d[3], ip[3], id[3];
+            for (int c = 0; c < 3; c++) w[c] = wa[c] + (wb[c] - wa[c]) * pr.alpha, d[c] = da_[c] + (db_[c] - da_[c]) * pr.alpha;
+            const float la = std::hypot(da_[0], da_[1], da_[2]), lb = std::hypot(db_[0], db_[1], db_[2]), ld = std::hypot(d[0], d[1], d[2]);
+            if (ld > 1e-6f)
+                for (float& x : d) x *= (la + (lb - la) * pr.alpha) / ld;
+            xform34(vt2.data(), w, ip);
+            for (int r = 0; r < 3; r++) id[r] = vt2[4 * r] * d[0] + vt2[4 * r + 1] * d[1] + vt2[4 * r + 2] * d[2];
+            const float pe = std::hypot(l.v[0] - ip[0], l.v[1] - ip[1], l.v[2] - ip[2]);
+            const float n1 = std::hypot(l.v[3], l.v[4], l.v[5]), n2 = std::hypot(id[0], id[1], id[2]);
+            const float cosd = n1 > 1e-6f && n2 > 1e-6f ? (l.v[3] * id[0] + l.v[4] * id[1] + l.v[5] * id[2]) / (n1 * n2) : 1.0f;
+            const float de = std::acos(std::clamp(cosd, -1.0f, 1.0f)) * 57.2958f;
+            const float move = std::hypot(wb[0] - wa[0], wb[1] - wa[1], wb[2] - wa[2]);
+            sProbeTotals.lights++;
+            if (pe <= 2.0f && de <= 0.3f) continue;
+            sProbeTotals.lightsFlagged++;
+            const s32 qa = b.partner.empty() ? -1 : b.partner[l.patch];
+            bool same = true;
+            for (int k = 0; k < 6; k++) same = same && l.v[k] == vb[k];
+            const char* cause = qa < 0 ? "unpaired" : qa != best ? "wrong-pair" : same ? "snapped" : "blend";
+            std::fprintf(sProbeOut, "L %u %.3f %s %.2f %.2f %08X %u %.0f %.0f %.0f move %.1f view %d\n", b.dumpFrame, pr.alpha, cause, pe, de,
+                         p.source, p.slot, wb[0], wb[1], wb[2], move, int(p.view) - int(mvb));
+        }
+        sProbeLights.erase(lit);
+    }
+    std::fprintf(sProbeOut, "R %u %.3f judged %u flagged %u max %.2f\n", b.dumpFrame, pr.alpha, judged, flagged, maxErr);
+}
+
+void probeProcess() {
+    if (!sProbeOut) return;
+    std::vector<ProbeRec> in;
+    {
+        std::lock_guard lk(sProbeM);
+        in.swap(sProbeIn);
+    }
+    // Records arrive when Aurora has processed a replay, which can be a frame or more after it was
+    // issued: a replay is complete once a later one has records (the FIFO is in order).
+    static std::unordered_map<u32, std::vector<ProbeRec>> byReplay;
+    for (const ProbeRec& r : in) byReplay[r.tag >> 20].push_back(r);
+    while (!sProbeIssued.empty()) {
+        const ProbeReplay& pr = sProbeIssued.front();
+        bool later = false;
+        for (size_t k = 1; k < sProbeIssued.size() && !later; k++) later = byReplay.count(sProbeIssued[k].id) != 0;
+        if (!later && sProbeIssued.size() < 64) break;
+        auto it = byReplay.find(pr.id);
+        if (it != byReplay.end()) {
+            if (pr.fresh) probeFresh(pr, it->second);
+            else probeBetween(pr, it->second);
+            byReplay.erase(it);
+        }
+        sProbeIssued.pop_front();
+    }
+    if (byReplay.size() > 256) byReplay.clear();
+    if (sProbeLights.size() > 64) sProbeLights.clear();
+    static u64 lastReport = 0;
+    if (sProbeTotals.replays >= lastReport + 200) {
+        lastReport = sProbeTotals.replays;
+        std::fprintf(sProbeOut, "S replays %llu judged %llu flagged %llu wrongpairs %llu swarm %llu notruth %llu mismatch %llu",
+                     (unsigned long long)sProbeTotals.replays, (unsigned long long)sProbeTotals.judged,
+                     (unsigned long long)sProbeTotals.flagged, (unsigned long long)sProbeTotals.wrongPairs,
+                     (unsigned long long)sProbeTotals.skippedSwarm, (unsigned long long)sProbeTotals.noTruth,
+                     (unsigned long long)sProbeTotals.mismatched);
+        for (int c = 0; c < 7; c++) std::fprintf(sProbeOut, " %s %llu", kCauseName[c], (unsigned long long)sProbeTotals.cause[c]);
+        std::fprintf(sProbeOut, " lights %llu flagged %llu", (unsigned long long)sProbeTotals.lights,
+                     (unsigned long long)sProbeTotals.lightsFlagged);
+        std::fprintf(sProbeOut, "\n");
+        std::fflush(sProbeOut);
+    }
+}
+// Before a test replay: tag its draws with a replay id (and, fresh, each draw with its bundle).
+void probeIssue(const TestItem& it) {
+    if (!sProbeOut) return;
+    static const bool sInit = [] {
+        AuroraSetDrawProbe(probeCallback);
+        return true;
+    }();
+    (void)sInit;
+    const u32 id = sProbeNextId++ & 0xFFF;
+    sProbeIssued.push_back({id, it.a, it.b, it.alpha, it.a == nullptr});
+    sProbeCurId = id;
+    GXSetProbeTagAurora(id << 20 | 0xFFFFF);
+    sProbeBundleTags = it.a == nullptr;
+}
+// replayPair (fresh replays): the bundle tag in front of each draw's commands.
+void probeTagBundles(const Tape& b, std::vector<u8>& buf, u32 id) {
+    static std::vector<std::pair<u32, u32>> marks;  // offset, tag
+    marks.clear();
+    for (u32 k = 0; k < b.bundleRange.size(); k++) {
+        const auto& r = b.bundleRange[k];
+        if (r[0] == ~0u || r[1] == ~0u || r[1] <= r[0] || r[1] > buf.size()) continue;
+        marks.emplace_back(r[0], id << 20 | (k & 0xFFFFF));
+        marks.emplace_back(r[1], id << 20 | 0xFFFFF);
+    }
+    std::stable_sort(marks.begin(), marks.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+    static std::vector<u8> out;
+    out.clear();
+    out.reserve(buf.size() + marks.size() * 7);
+    u32 pos = 0;
+    for (const auto& [at, tag] : marks) {
+        if (at < pos) continue;
+        out.insert(out.end(), buf.begin() + pos, buf.begin() + at);
+        pos = at;
+        out.push_back(0x50);
+        out.push_back(u8(GX_AURORA_PROBE_TAG >> 8));
+        out.push_back(u8(GX_AURORA_PROBE_TAG));
+        for (int s = 24; s >= 0; s -= 8) out.push_back(u8(tag >> s));
+    }
+    out.insert(out.end(), buf.begin() + pos, buf.end());
+    buf.swap(out);
+}
+
 bool testReplay() {
+    probeProcess();
     if (sTestItems.empty()) {
         bool pending;
         {
@@ -2375,7 +2938,9 @@ bool testReplay() {
             log("[dbg] poisoned %08X+%X for %s", pphys, psize, nm);
         }
     }
+    probeIssue(it);
     replayPair(it.a.get(), *it.b, it.alpha, it.target);
+    sProbeBundleTags = false;
     if (!saved.empty()) {
         AuroraGXSync();
         std::memcpy(g_mem + pphys, saved.data(), psize);
@@ -2413,6 +2978,444 @@ bool testReplay() {
         }
     }
     return true;
+}
+
+// --- live judder detector (LM_JUDDER_LOG=<file>; docs/INTERPOLATION.md "Pass 6") ---------------
+// Real play, any frame rate: every presented frame's draws are reported by Aurora (draw probe)
+// with the matrix and first vertex they were drawn with. Each draw's world position is taken
+// through the blended main camera that present was drawn with. Over one game frame interval
+// (tape a -> b) a correctly interpolated draw moves linearly in the interval's alpha, and where
+// one interval ends (alpha 1: game frame b) the next must start (alpha 0 of b -> c). Per draw
+// (display list + index within it, followed from interval to interval by nearest world position):
+// - jump: the gap between where an interval ends and the next begins (snapped or unblended
+//   values, pairing flips, unpaired draws shown as captured, values not noted for blending);
+// - bend: how far the presents of one interval are off a straight line (uneven blending).
+// Both in pixels of the current render resolution; a draw over LM_JUDDER_PX (default 1.5) is
+// logged with its cause class, and every second gets a summary line.
+FILE* const sLive = [] {
+    const char* p = std::getenv("LM_JUDDER_LOG");
+    return p && *p ? std::fopen(p, "w") : nullptr;
+}();
+const float sLivePx = [] {
+    const char* v = std::getenv("LM_JUDDER_PX");
+    return v ? float(std::atof(v)) : 1.5f;
+}();
+const Clock::time_point sLiveT0 = Clock::now();
+double liveMs() { return std::chrono::duration<double, std::milli>(Clock::now() - sLiveT0).count(); }
+
+struct LiveIssued {
+    u32 id;
+    std::shared_ptr<const Tape> a, b;
+    float alpha;
+    u32 present;
+    double ms;
+    bool camOk;
+    M34 vt;  // the blended main camera this present was drawn with
+};
+std::deque<LiveIssued> sLiveIssued;
+u32 sLiveNextId = 1;
+
+struct LiveSample {
+    float alpha;
+    f32 world[3];
+    f32 view[3];
+};
+struct LiveUnit {
+    u32 bundle;
+    u16 sub;
+    std::vector<LiveSample> s;
+    f32 e0[3], e1[3];  // fitted world position at alpha 0 and 1
+    bool fit = false;
+};
+// One interval: the presents that showed tape b (blended from its predecessor).
+struct LiveInterval {
+    std::shared_ptr<const Tape> a, b;
+    std::unordered_map<u32, LiveUnit> units;  // key bundle << 12 | sub
+    M34 vb{};                                 // b's main camera (the interval's end)
+    bool vbOk = false;
+    f32 proj[16] = {};
+    bool projOk = false;
+    u32 presents = 0;
+    double ms = 0;
+};
+LiveInterval sLiveCur, sLivePrev;
+bool sLiveHaveCur = false, sLiveHavePrev = false;
+u32 sLiveHeight = 1080;
+
+// Chains of flagged display lists (filled by the guest thread at the next call of that list).
+std::mutex sChainM;
+std::unordered_map<u32, std::string> sChains;  // "" = wanted, not seen yet
+std::atomic<bool> sChainsWanted{false};
+
+struct LiveFlag {
+    u32 n = 0, map = 0, room = 0, tape = 0, dl = 0, sub = 0;
+    int inroom = -1;
+    float max = 0, sum = 0, step = 0;
+    double first = 0, last = 0;
+    u64 id = 0;
+    f32 world[3] = {};
+    u32 cause[8] = {};
+};
+struct LiveStats {
+    std::unordered_map<u64, LiveFlag> flags;  // per thing (display list, index, rounded place)
+    u32 presents = 0, intervals = 0, units = 0, jumps = 0, bends = 0, mismatched = 0;
+    u32 cause[8] = {};
+    float worst = 0;
+    std::string worstWhat;
+} sLiveSec;
+double sLiveSecStart = 0;
+const char* const kLiveCause[8] = {"unpaired", "snapped", "not-noted", "pairing-flip", "other-camera", "blend", "inherited", "?"};
+
+bool liveScreen(const f32* P, const M34& V, const f32 w[3], f32 out[2]) {
+    f32 v[3];
+    xform34(V.data(), w, v);
+    const f32 x = P[0] * v[0] + P[1] * v[1] + P[2] * v[2] + P[3];
+    const f32 y = P[4] * v[0] + P[5] * v[1] + P[6] * v[2] + P[7];
+    const f32 ww = P[12] * v[0] + P[13] * v[1] + P[14] * v[2] + P[15];
+    if (!(ww > 1.0f)) return false;
+    const f32 aspect = P[0] != 0.0f ? P[5] / P[0] : 1.0f;
+    out[0] = x / ww * 0.5f * float(sLiveHeight) * aspect;
+    out[1] = y / ww * 0.5f * float(sLiveHeight);
+    return std::fabs(out[0]) < 0.6f * float(sLiveHeight) * aspect * 1.2f && std::fabs(out[1]) < 0.6f * float(sLiveHeight);
+}
+
+void fitUnit(LiveUnit& u) {
+    const size_t n = u.s.size();
+    if (n == 0) return;
+    float sa = 0, saa = 0;
+    for (const auto& x : u.s) sa += x.alpha, saa += x.alpha * x.alpha;
+    const float den = float(n) * saa - sa * sa;
+    for (int c = 0; c < 3; c++) {
+        float sw = 0, saw = 0;
+        for (const auto& x : u.s) sw += x.world[c], saw += x.alpha * x.world[c];
+        if (n >= 2 && std::fabs(den) > 1e-6f) {
+            const float k = (float(n) * saw - sa * sw) / den, b0 = (sw - k * sa) / float(n);
+            u.e0[c] = b0, u.e1[c] = b0 + k;
+        } else {
+            u.e0[c] = u.e1[c] = sw / float(n);  // one present: no slope (a stall or a cut)
+        }
+    }
+    u.fit = n >= 2 && std::fabs(den) > 1e-6f;
+}
+
+// The interp value the draw's matrix most likely came from: the first position matrix noted for
+// its bundle, or for the nearest earlier bundle that noted one (a matrix loaded once for several
+// display lists). Returns the patch index or -1; `inherited` when it belongs to an earlier bundle.
+s32 bundleMatrix(const Tape& t, u32 bundle, bool& inherited) {
+    static const Tape* sT = nullptr;
+    static u64 sSeq = 0;
+    static std::vector<s32> first;
+    if (sT != &t || sSeq != t.seq) {
+        sT = &t, sSeq = t.seq;
+        first.assign(t.bundleIds.size(), -1);
+        for (u32 i = 0; i < t.patches.size(); i++) {
+            const Patch& p = t.patches[i];
+            if (p.kind == Kind::PosMtx && p.role == 0 && p.bundle < first.size() && first[p.bundle] < 0) first[p.bundle] = s32(i);
+        }
+    }
+    inherited = false;
+    for (s32 k = s32(bundle); k >= 0 && k > s32(bundle) - 64; k--) {
+        if (u32(k) < first.size() && first[k] >= 0) {
+            inherited = u32(k) != bundle;
+            return first[k];
+        }
+    }
+    return -1;
+}
+
+void liveFinish() {
+    if (!sLiveHaveCur) return;
+    LiveInterval& cur = sLiveCur;
+    for (auto& [k, u] : cur.units) fitUnit(u);
+    sLiveSec.intervals++;
+    // Bends: presents off the interval's straight line.
+    if (cur.projOk) {
+        // The camera of each present is not kept per sample: the view-space position is, and the
+        // world-space residual is projected with the interval's end camera (close enough for pixels).
+        for (auto& [k, u] : cur.units) {
+            if (!u.fit || u.s.size() < 3 || !cur.vbOk) continue;
+            float worst = 0;
+            for (const auto& x : u.s) {
+                f32 lw[3], p0[2], p1[2];
+                for (int c = 0; c < 3; c++) lw[c] = u.e0[c] + (u.e1[c] - u.e0[c]) * x.alpha;
+                if (!liveScreen(cur.proj, cur.vb, lw, p0) || !liveScreen(cur.proj, cur.vb, x.world, p1)) continue;
+                worst = std::max(worst, std::hypot(p0[0] - p1[0], p0[1] - p1[1]));
+            }
+            if (worst > sLivePx) {
+                sLiveSec.bends++;
+                const Tape& b = *cur.b;
+                std::fprintf(sLive, "B %.1f %u %u bend %.2f dl %08X id %016llX sub %u world %.0f %.0f %.0f\n", cur.ms, u32(b.seq),
+                             cur.presents, worst, u.bundle < b.bundleDl.size() ? b.bundleDl[u.bundle] : 0u,
+                             (unsigned long long)b.bundleIds[u.bundle], u.sub, u.e1[0], u.e1[1], u.e1[2]);
+            }
+        }
+    }
+    // Jumps: where the previous interval ended against where this one starts (game frame a).
+    if (sLiveHavePrev && sLivePrev.b == cur.a && cur.projOk && sLivePrev.vbOk) {
+        const Tape& a = *cur.a;
+        const Tape& b = *cur.b;
+        std::unordered_map<u64, std::vector<const LiveUnit*>> prevById;
+        for (const auto& [k, u] : sLivePrev.units)
+            if (u.bundle < a.bundleIds.size()) prevById[mix(a.bundleIds[u.bundle] ^ u64(u.sub) << 48)].push_back(&u);
+        const u32 room = rd32(VA(0x803A3CA0) + 0xC) >> 24;
+        const u32 map = rd32(VA(0x804D80C8));
+        for (auto& [k, u] : cur.units) {
+            if (u.bundle >= b.bundleIds.size()) continue;
+            const auto it = prevById.find(mix(b.bundleIds[u.bundle] ^ u64(u.sub) << 48));
+            if (it == prevById.end()) continue;
+            const LiveUnit* best = nullptr;
+            float bd = 1e30f;
+            for (const LiveUnit* p : it->second) {
+                const float d = std::hypot(p->e1[0] - u.e0[0], p->e1[1] - u.e0[1], p->e1[2] - u.e0[2]);
+                if (d < bd) bd = d, best = p;
+            }
+            if (!best || bd > 150.0f || (it->second.size() > 8 && bd > 5.0f)) continue;
+            sLiveSec.units++;
+            f32 s0[2], s1[2], m0[2], m1[2];
+            if (!liveScreen(cur.proj, sLivePrev.vb, best->e1, s0) || !liveScreen(cur.proj, sLivePrev.vb, u.e0, s1)) continue;
+            const float jump = std::hypot(s1[0] - s0[0], s1[1] - s0[1]);
+            if (jump <= sLivePx) continue;
+            float step = 0;
+            if (liveScreen(cur.proj, cur.vb, u.e0, m0) && liveScreen(cur.proj, cur.vb, u.e1, m1)) step = std::hypot(m1[0] - m0[0], m1[1] - m0[1]);
+            // Cause.
+            bool inherited = false;
+            const s32 pi = bundleMatrix(b, u.bundle, inherited);
+            int cause;
+            const s32 qa = pi >= 0 && !b.partner.empty() ? b.partner[pi] : -1;
+            // Snapped: the draw stayed put in view space through the interval while the camera moved.
+            float viewMove = 0;
+            for (const auto& x : u.s) viewMove = std::max(viewMove, std::hypot(x.view[0] - u.s[0].view[0], x.view[1] - u.s[0].view[1], x.view[2] - u.s[0].view[2]));
+            if (pi < 0) cause = 2;
+            else if (qa < 0) cause = 0;
+            else if (a.patches[qa].bundle != best->bundle && !inherited) cause = 3;
+            else if (u.s.size() >= 2 && viewMove < 0.01f) cause = 1;
+            else if (b.patches[pi].view != mainViewOf(b)) cause = 4;
+            else if (inherited) cause = 6;
+            else cause = 5;
+            sLiveSec.jumps++;
+            sLiveSec.cause[cause]++;
+            const u32 dl = u.bundle < b.bundleDl.size() ? b.bundleDl[u.bundle] : 0u;
+            if (jump > sLiveSec.worst) {
+                char w[96];
+                std::snprintf(w, sizeof(w), "%s dl %08X room %d", kLiveCause[cause], dl, enh::roomAt(u.e0));
+                sLiveSec.worst = jump, sLiveSec.worstWhat = w;
+            }
+            const u64 key = mix(u64(dl ? dl : u32(b.bundleIds[u.bundle])) << 16 ^ u.sub ^
+                                u64(u32(s32(std::lround(u.e0[0] / 50.0f)) & 0xFFFF) | u32(s32(std::lround(u.e0[2] / 50.0f)) & 0xFFFF) << 16) << 28);
+            LiveFlag& f = sLiveSec.flags[key];
+            if (f.n == 0) {
+                f.map = map, f.room = room, f.tape = u32(b.seq), f.dl = dl, f.sub = u.sub, f.id = b.bundleIds[u.bundle];
+                f.inroom = enh::roomAt(u.e0), f.first = cur.ms;
+                std::copy(u.e0, u.e0 + 3, f.world);
+            }
+            f.n++, f.max = std::max(f.max, jump), f.sum += jump, f.step = std::max(f.step, step), f.last = cur.ms;
+            f.cause[cause]++;
+        }
+    }
+    sLivePrev = std::move(sLiveCur);
+    sLiveHavePrev = true;
+    sLiveCur = {};
+    sLiveHaveCur = false;
+}
+
+void liveProcess(const LiveIssued& li, std::vector<ProbeRec>& recs) {
+    const Tape& b = *li.b;
+    sLiveSec.presents++;
+    u32 total = 0;
+    for (u16 n : b.bundleDraws) total += n;
+    if (total != recs.size()) {
+        sLiveSec.mismatched++;
+        return;
+    }
+    if (sLiveHaveCur && sLiveCur.b != li.b) liveFinish();
+    if (!sLiveHaveCur) {
+        sLiveCur.a = li.a;
+        sLiveCur.b = li.b;
+        sLiveCur.ms = li.ms;
+        const u16 mv = mainViewOf(b);
+        sLiveCur.vbOk = mv < b.views.size();
+        if (sLiveCur.vbOk) sLiveCur.vb = b.views[mv];
+        sLiveHaveCur = true;
+    }
+    LiveInterval& cur = sLiveCur;
+    cur.presents++;
+    if (!li.camOk) return;
+    M34 inv;
+    if (!invertAffine(li.vt.data(), inv.data())) return;
+    // The main projection: the most common perspective one.
+    std::unordered_map<u64, std::pair<u32, u32>> pc;
+    for (u32 k = 0; k < recs.size(); k++)
+        if (perspective(recs[k].proj)) {
+            u64 h = 0;
+            for (int e = 0; e < 16; e++) h = mix(h ^ std::bit_cast<u32>(recs[k].proj[e]));
+            auto& x = pc[h];
+            x.first++, x.second = k;
+        }
+    u32 best = 0, bestK = 0;
+    for (const auto& [h, x] : pc)
+        if (x.first > best) best = x.first, bestK = x.second;
+    if (!best) return;
+    const f32* P = recs[bestK].proj;
+    std::memcpy(cur.proj, P, sizeof(cur.proj));
+    cur.projOk = true;
+    u32 k = 0;
+    const u16 mv = mainViewOf(b);
+    for (u32 bundle = 0; bundle < b.bundleDraws.size(); bundle++) {
+        bool main = !(bundle < b.bundlePass.size() && b.bundlePass[bundle] != 0);
+        if (main && b.bundleDraws[bundle]) {  // drawn under another camera (a light's pass, a reflection): not judged
+            bool inh;
+            const s32 pi = bundleMatrix(b, bundle, inh);
+            main = pi < 0 || b.patches[pi].view == mv || b.patches[pi].view == 0xFFFF;
+        }
+        for (u16 sub = 0; sub < b.bundleDraws[bundle]; sub++, k++) {
+            const ProbeRec& r = recs[k];
+            if (!main || !r.hasPos || std::memcmp(r.proj, P, sizeof(f32) * 16) != 0 || sub >= 0xFFF) continue;
+            LiveSample s;
+            s.alpha = li.a ? li.alpha : 1.0f;
+            xform34(r.mtx, r.pos, s.view);
+            xform34(inv.data(), s.view, s.world);
+            if (!std::isfinite(s.world[0] + s.world[1] + s.world[2])) continue;
+            LiveUnit& u = cur.units[bundle << 12 | sub];
+            u.bundle = bundle, u.sub = sub;
+            if (u.s.size() < 16) u.s.push_back(s);
+        }
+    }
+}
+
+void liveSecond() {
+    const double now = liveMs();
+    if (now - sLiveSecStart < 1000.0) return;
+    std::fprintf(sLive, "S %.1f presents %u intervals %u units %u jumps %u bends %u mismatched %u", now, sLiveSec.presents,
+                 sLiveSec.intervals, sLiveSec.units, sLiveSec.jumps, sLiveSec.bends, sLiveSec.mismatched);
+    for (int c = 0; c < 7; c++)
+        if (sLiveSec.cause[c]) std::fprintf(sLive, " %s %u", kLiveCause[c], sLiveSec.cause[c]);
+    if (sLiveSec.jumps) std::fprintf(sLive, " worst %.1f px (%s)", sLiveSec.worst, sLiveSec.worstWhat.c_str());
+    std::fprintf(sLive, "\n");
+    // The worst things of this second (by how often x how far they jumped).
+    std::vector<const LiveFlag*> top;
+    for (const auto& [k, f] : sLiveSec.flags) top.push_back(&f);
+    std::sort(top.begin(), top.end(), [](const LiveFlag* x, const LiveFlag* y) { return x->max * x->n > y->max * y->n; });
+    for (size_t i = 0; i < top.size() && i < 12; i++) {
+        const LiveFlag& f = *top[i];
+        int c = 0;
+        for (int j = 1; j < 8; j++)
+            if (f.cause[j] > f.cause[c]) c = j;
+        std::string chain;
+        if (f.dl) {
+            std::lock_guard lk(sChainM);
+            auto [ci, fresh] = sChains.try_emplace(f.dl);
+            if (fresh) sChainsWanted = true;
+            chain = ci->second;
+        }
+        std::fprintf(sLive,
+                     "J %.1f-%.1f map %u room %u %s jumps %u max %.2f mean %.2f px step %.1f px dl %08X id %016llX sub %u world %.0f %.0f %.0f inroom %d tape %u%s%s\n",
+                     f.first, f.last, f.map, f.room, kLiveCause[c], f.n, f.max, f.sum / float(f.n), f.step, f.dl,
+                     (unsigned long long)f.id, f.sub, f.world[0], f.world[1], f.world[2], f.inroom, f.tape,
+                     chain.empty() ? "" : " chain ", chain.c_str());
+    }
+    // Chains that arrived.
+    {
+        std::lock_guard lk(sChainM);
+        static std::unordered_set<u32> printed;
+        for (const auto& [dl, ch] : sChains)
+            if (!ch.empty() && printed.insert(dl).second) std::fprintf(sLive, "C %08X %s\n", dl, ch.c_str());
+    }
+    std::fflush(sLive);
+    sLiveSec = {};
+    sLiveSecStart = now;
+}
+
+// Host thread, before a real-time replay: what earlier presents drew (Aurora has processed them).
+void liveBefore() {
+    if (!sLive) return;
+    static const bool sInit = [] {
+        AuroraSetDrawProbe(probeCallback);
+        return true;
+    }();
+    (void)sInit;
+    u32 w = 0, h = 0;
+    AuroraGetRenderSize(&w, &h);
+    if (h) sLiveHeight = h;
+    // The work is done on a worker thread (the host loop only hands over what it has).
+    struct Batch {
+        std::vector<ProbeRec> recs;
+        std::deque<LiveIssued> issued;
+    };
+    static std::mutex sQM;
+    static std::condition_variable sQCv;
+    static std::deque<Batch> sQ;
+    static const bool sWorkerStarted = [] {
+        std::thread([] {
+        for (;;) {
+            Batch bt;
+            {
+                std::unique_lock lk(sQM);
+                sQCv.wait(lk, [] { return !sQ.empty(); });
+                bt = std::move(sQ.front());
+                sQ.pop_front();
+            }
+            // A present's records can arrive a frame or more after it was issued: it is complete
+            // once a later present has records (the FIFO is in order).
+            static std::unordered_map<u32, std::vector<ProbeRec>> byId;
+            static std::deque<LiveIssued> issued;
+            for (const ProbeRec& r : bt.recs) byId[r.tag >> 20].push_back(r);
+            for (LiveIssued& li : bt.issued) issued.push_back(std::move(li));
+            while (!issued.empty()) {
+                bool later = false;
+                for (size_t k = 1; k < issued.size() && !later; k++) later = byId.count(issued[k].id) != 0;
+                if (!later && issued.size() < 64) break;
+                auto it = byId.find(issued.front().id);
+                if (it != byId.end()) {
+                    liveProcess(issued.front(), it->second);
+                    byId.erase(it);
+                }
+                issued.pop_front();
+            }
+            if (byId.size() > 256) byId.clear();
+            liveSecond();
+        }
+        }).detach();
+        return true;
+    }();
+    (void)sWorkerStarted;
+    Batch bt;
+    {
+        std::lock_guard lk(sProbeM);
+        bt.recs.swap(sProbeIn);
+    }
+    bt.issued.swap(sLiveIssued);
+    {
+        std::lock_guard lk(sQM);
+        if (sQ.size() > 64) sQ.pop_front();  // the worker fell behind: drop the oldest
+        sQ.push_back(std::move(bt));
+    }
+    sQCv.notify_one();
+}
+void liveIssue(const std::shared_ptr<const Tape>& a, const std::shared_ptr<const Tape>& b, float alpha, u32 present) {
+    if (!sLive) return;
+    const u32 id = sLiveNextId++ & 0xFFF;
+    if (id == 0) return;
+    LiveIssued li{id, a, b, alpha, present, liveMs(), false, {}};
+    GXSetProbeTagAurora(id << 20 | 0xFFFFF);
+    sLiveIssued.push_back(std::move(li));
+}
+// After replayPair: the blended main camera it used.
+void liveCamera(const Tape* a, const Tape& b) {
+    if (!sLive || sLiveIssued.empty()) return;
+    LiveIssued& li = sLiveIssued.back();
+    const u16 mv = mainViewOf(b);
+    if (mv >= b.views.size()) return;
+    if (!a || b.cut || b.pairedWith != a || li.alpha >= 1.0f) {  // (sViewPairs are only built for alpha < 1)
+        li.vt = b.views[mv], li.camOk = true;
+        li.alpha = 1.0f;
+        li.a = nullptr;
+        return;
+    }
+    for (const ViewPair& vp : sViewPairs)
+        if (u16(vp.key) == mv && vp.ok && !vp.cut) {
+            li.vt = vp.vt, li.camOk = true;
+            return;
+        }
 }
 
 }  // namespace
@@ -2569,6 +3572,7 @@ PresentInfo lastPresent() { return sLastPresent; }
 
 bool replay(bool final) {
     if (sTestSteps && !final) return testReplay();
+    liveBefore();
     std::shared_ptr<const Tape> a, b;
     float alpha = 1.0f;
     const auto r0 = Clock::now();
@@ -2627,7 +3631,9 @@ bool replay(bool final) {
                (unsigned long long)(a && !final ? a->seq : 0), alpha,
                a && !final ? double(a->retrace) + alpha * double(b->retrace - a->retrace) : double(b->retrace),
                sPacer.d * 1000.0, sLastPresent.present, (unsigned long long)aurora_frame_counter());
+    liveIssue(final ? nullptr : a, b, alpha, sLastPresent.present);
     replayPair(final ? nullptr : a.get(), *b, alpha, nullptr);
+    liveCamera(final ? nullptr : a.get(), *b);
     if (sJudder && a && !final && alpha < 1.0f) {
         // V present m[12]: the blended camera of b's main camera (most position matrices), the one
         // static scenery is drawn with: tools/interp/judder.py --camera checks that a fixed point
@@ -2710,6 +3716,19 @@ bool replay(bool final) {
 }
 
 bool judderLogOn() { return sJudder != nullptr; }
+bool chainWanted(u32 dlAddr) {
+    if (!sChainsWanted.load(std::memory_order_relaxed)) return false;
+    std::lock_guard lk(sChainM);
+    const auto it = sChains.find(dlAddr);
+    return it != sChains.end() && it->second.empty();
+}
+void setChain(u32 dlAddr, const std::string& chain) {
+    std::lock_guard lk(sChainM);
+    sChains[dlAddr] = chain.empty() ? "?" : chain;
+    bool any = false;
+    for (const auto& [k, v] : sChains) any = any || v.empty();
+    sChainsWanted = any;
+}
 void logPresentTiming(u64 frame, int64_t submitNs, int64_t presentNs, int64_t doneNs) {
     if (!sJudder) return;
     // P frame submit present gpu-done (us, judder time base; Aurora patch 0197)

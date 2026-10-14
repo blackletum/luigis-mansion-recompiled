@@ -914,6 +914,7 @@ GXHLE(GXCallDisplayList) {
     interp::snapAfterDraw();
     if (interp::drawLogActive()) interp::drawLogCaller(guestChain(c));
     if (interp::capturing()) interp::vtxDisplayList(c.r[3], hostp(c.r[3]), c.r[4]);
+    if (interp::chainWanted(c.r[3])) interp::setChain(c.r[3], guestChain(c));
 }
 GXHLE(GXBeginDisplayList) {
     sInDisplayList = true;

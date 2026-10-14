@@ -10,11 +10,15 @@
 
 #include <dolphin/pad.h>
 
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace recomp {
+u32 copyDispCount();  // hle_gx.cpp: guest frame number (LM_FRAME_DUMP numbering)
 u16 padButtons();  // hle_pad.cpp: port 1 buttons as last handed to the game
 void unusedAssetsFrame(Ctx& c);  // unused_assets.cpp: per-frame work (nozzles)
 void testStateFrame(Ctx& c);     // test_state.cpp: LM_TEST_STATE presets
@@ -112,6 +116,59 @@ HLE(fn_8003CFC0) {
                 wr32(actor + 0x4C, std::bit_cast<u32>(z));
                 log("[unused] teleported Luigi to %.0f,%.0f,%.0f", x, y, z);
             }
+        }
+    }
+    // Test aid (judder sweep, tools/interp/judder_sweep.py): LM_ROOM_TOUR=<first frame>,<frames per
+    // room>,<room>[:<room>...] puts Luigi in each listed room in turn (the room table's centre,
+    // `<room>@x,z` for a spot of its own), guest frame numbers as in LM_FRAME_DUMP.
+    static const char* sTour = std::getenv("LM_ROOM_TOUR");
+    if (sTour && *sTour) {
+        static u32 sFirst = 0, sPer = 0;
+        static std::vector<std::string> sStops;
+        if (!sPer) {
+            const std::string s = sTour;
+            std::sscanf(s.c_str(), "%u,%u", &sFirst, &sPer);
+            const size_t c2 = s.find(',', s.find(',') + 1);
+            for (size_t p = c2 == std::string::npos ? s.size() : c2 + 1; p < s.size();) {
+                const size_t e = std::min(s.find(':', p), s.size());
+                sStops.push_back(s.substr(p, e - p));
+                p = e + 1;
+            }
+            if (!sPer) sPer = 1;
+        }
+        const u32 f = copyDispCount();
+        static u32 sLastStop = ~0u;
+        if (f >= sFirst && (f - sFirst) / sPer < sStops.size() && (f - sFirst) / sPer != sLastStop) {
+            const u32 i = (f - sFirst) / sPer;
+            const u32 actor = rd32(VA(0x803D48A0));
+            const u32 rooms = rd32(VA(0x804D8170));
+            int room = -1;
+            float px = 0, pz = 0;
+            const int n = std::sscanf(sStops[i].c_str(), "%d@%f,%f", &room, &px, &pz);
+            if (actor >= 0x80000000u && actor < 0x81800000u && (rooms >> 28) == 8 && room >= 0 && room < 80) {
+                sLastStop = i;
+                const u32 b = rooms + u32(room) * 0x30;
+                float lo[3], hi[3];
+                for (int k = 0; k < 3; k++) lo[k] = float(s32(rd32(b + 8 + 4 * k))), hi[k] = float(s32(rd32(b + 0x14 + 4 * k)));
+                if (!(hi[0] > lo[0] && hi[2] > lo[2] && hi[0] - lo[0] < 20000.0f && hi[2] - lo[2] < 20000.0f)) {
+                    log("[tour] f%u stop %u room %d: no bounds", f, i, room);
+                } else {
+                    const float x = n == 3 ? px : (lo[0] + hi[0]) * 0.5f, z = n == 3 ? pz : (lo[2] + hi[2]) * 0.5f, y = lo[1] + 60.0f;
+                    wr32(actor + 0x44, std::bit_cast<u32>(x));
+                    wr32(actor + 0x48, std::bit_cast<u32>(y));
+                    wr32(actor + 0x4C, std::bit_cast<u32>(z));
+                    log("[tour] f%u stop %u room %d at %.0f,%.0f,%.0f (bounds %.0f %.0f %.0f .. %.0f %.0f %.0f)", f, i, room, x, y,
+                        z, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
+                }
+            }
+        }
+        // Where Luigi ended up, half-way through each stop.
+        if (f >= sFirst && (f - sFirst) % sPer == sPer / 2 && (f - sFirst) / sPer < sStops.size()) {
+            const u32 actor = rd32(VA(0x803D48A0));
+            if (actor >= 0x80000000u && actor < 0x81800000u)
+                log("[tour] f%u luigi %.0f %.0f %.0f room %d", f, std::bit_cast<f32>(rd32(actor + 0x44)),
+                    std::bit_cast<f32>(rd32(actor + 0x48)), std::bit_cast<f32>(rd32(actor + 0x4C)),
+                    s32(rd32(VA(0x803A3CA0) + 0xC) >> 24));
         }
     }
 }

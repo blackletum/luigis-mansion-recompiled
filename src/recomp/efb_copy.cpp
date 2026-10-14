@@ -112,6 +112,10 @@ void writePpm(const u8* gx, u32 w, u32 h, u32 frameNo) {
 }
 
 void writePpmPath(const u8* gx, u32 w, u32 h, const char* path) {
+    // Test aid LM_FRAME_DUMP_NOWRITE=1: the dump copies are made (LM_INTERP_TEST paces itself by
+    // them) but not written to disk (long LM_INTERP_PROBE sweeps).
+    static const bool sNoWrite = envInt("LM_FRAME_DUMP_NOWRITE", 0) != 0;
+    if (sNoWrite) return;
     std::vector<u8> rgb(size_t(w) * h * 3);
     const u32 tilesPerRow = (w + 3) / 4;
     for (u32 y = 0; y < h; y++)

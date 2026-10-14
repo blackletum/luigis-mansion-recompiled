@@ -215,7 +215,10 @@ u32 parse(const u8* p, u32 size, bool partial) {
                 return size;
             }
             len = 3 + count * vs;
-            if (i + len <= size) scanVertices(fmt, p + i + 3, count, vs);
+            if (i + len <= size) {
+                scanVertices(fmt, p + i + 3, count, vs);
+                if (count != 0 && !sSnapParse) detail::countDraw();
+            }
         } else if (op == GX_AURORA) {  // only in display lists the game recorded through Aurora
             sAuroraInDl++;
             sUnparsed++;
@@ -319,6 +322,7 @@ void vtxBegin(u32 prim, u32 fmt, u32 nVerts, bool perspective) {
     u64 id = u64(prim & 0xF8 | fmt) << 56 ^ u64(vertexSize(int(fmt))) << 40 ^ (posIndexed ? sBind[0].guest : 0);
     for (int a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; a++) id = detail::mix(id ^ gx::vtxDesc(a));
     detail::noteDraw(id);
+    if (nVerts != 0) detail::countDraw();
     detail::drawStart(mark());
     detail::drawLog("begin prim %02X fmt %u n %u vsize %u %s pos desc %u size %d tex0 desc %u size %d clr0 desc %u",
                     prim & 0xF8, fmt, nVerts, vertexSize(int(fmt)), perspective ? "persp" : "ortho", gx::vtxDesc(GX_VA_POS),
@@ -360,6 +364,7 @@ void vtxDisplayList(u32 guestAddr, const u8* data, u32 size) {
     finishDirect();
     flushPending();
     detail::noteDraw(detail::mix(u64(guestAddr) << 24 ^ size ^ 0xD15Bull << 48));
+    detail::noteDrawDl(guestAddr);
     {
         // Content identity (FNV-1a over 8-byte words): the same mesh wherever its list is stored.
         u64 h = 0xCBF29CE484222325ull ^ size;

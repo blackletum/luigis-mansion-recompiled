@@ -159,6 +159,8 @@ void drawEnd(u32 end);
 void noteDraw(u64 id);
 // The draw just noted: its storage-independent identity (a display list's content hash).
 void noteDrawAlt(u64 alt);
+void noteDrawDl(u32 guestAddr);  // the draw just noted is this display list (judder detector reports)
+void countDraw();                // a GX draw command (non-empty primitive) belonging to the draw just noted
 // Immediate-mode vertices with direct f32 XYZ positions: `count` vertices of `stride`
 // bytes starting at tape offset `at`, position at `posOffset` in each.
 void noteVertices(u32 at, u32 count, u32 stride, u32 posOffset, u64 id);
@@ -171,6 +173,10 @@ u8* captureBytes();  // the capture buffer (tape offsets index it)
 // This tape's texture/TLUT copies (kept alive by the tape) and the bytes newly copied.
 void texEndTape(std::vector<std::shared_ptr<const std::vector<u8>>>& keep, u64& copiedBytes);
 }  // namespace detail
+
+// Judder detector (LM_JUDDER_LOG): display lists it flagged want their guest call chain once.
+bool chainWanted(u32 dlAddr);
+void setChain(u32 dlAddr, const std::string& chain);
 
 // LM_INTERP_DRAWS: whether this draw is being logged, and its guest call chain.
 bool drawLogActive();
