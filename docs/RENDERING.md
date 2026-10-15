@@ -2626,7 +2626,7 @@ wall lighting next to the foyer candelabras stepping at the game frame. Not inve
 - The 6-bit resolve (0176) could avoid its full-target copy only with in-place read-modify-write
   (framebuffer fetch / read-write storage on RGBA8), which WebGPU does not offer on D3D12.
 
-## Flashlight cone meets the floor (investigation in progress)
+## Flashlight cone meets the floor (investigated; no GX-level cause found)
 
 User report: in vanilla rendering the game's cone mesh (`handlight_ef`) ends in a hard line where it
 enters the floor; console/Dolphin show it fading into the floor. Findings so far (foyer, US,
@@ -2640,12 +2640,29 @@ enters the floor; console/Dolphin show it fading into the floor. Findings so far
 - The hard line is a depth clip: with the cone's Z test disabled (`AURORA_EXP_SRTG_NOZ=1`) the beam
   continues smoothly over the floor like the console shot. Bisecting with `AURORA_DRAW_SKIP` puts
   the occluder in the main pass's first ~650 room draws (the foyer floor area).
+- The occluder, pinned with `AURORA_DRAW_LOG_PIXEL=150,400` (16:9, 1920x1080 window, frame
+  2660 of the dump script): the only depth-writing triangle at that EFB pixel in the main pass is
+  the foyer floor (a 22-vertex strip: Z LEQUAL with update, Z before texturing, alpha test
+  GREATER 0, blend SRCALPHA/INVSRCALPHA), at z24 16616768. Both surfaces of the cone there lie
+  behind it: z24 16617694 (near side) and 16627013..16641918 (far side), i.e. the cone's lower half
+  is about 10 units and more under the floor (eye distance ~1670 with LM's near 16 / far 8192
+  projection; one z24 step is ~0.1 unit there). Cone and floor use the same projection, viewport
+  (depth 0..1) and EFB, nothing writes depth at that pixel between them (no copy clear, no Z
+  texture), so the console's 24-bit Z test rejects those pixels as well: the clip is geometric,
+  not a precision, depth-range or early-Z effect.
 - Not the cause (no visible change at native resolution): 24-bit Z quantization of every draw
-  (`AURORA_Z24_EXP=1`), early-Z cut-out depth (`early_z_alpha_depth=false`), 6-bit blending, colour
+  (a frag_depth experiment, removed again), early-Z cut-out depth (`early_z_alpha_depth=false`), 6-bit blending, colour
   depth, integer TEV, GX zfreeze/coplanar (never enabled by LM), fog (never used).
 - Debug-tool artifact found and fixed: a draw dropped by `AURORA_DRAW_SKIP`/`_MATCH` let the same
   draw's later primitives merge into the previous draw's command (drawn with the wrong state). That
   is what looked like "the cone's alpha removes a blue tint" in earlier experiments.
+
+- Open: the console reference (`out/refs/flashlight_console.webp`) is a side view in a hallway
+  where it cannot be told whether the beam reaches the floor; its lower beam edge also shows 480p
+  stair steps. A console/Dolphin capture of the same foyer shot (beam aimed down, as in
+  `out/flashlight_floor/`) is needed before changing anything: if the console shows the cone over
+  the floor there, the difference is upstream of GX (cone or floor geometry, e.g. Luigi's hand
+  height or the beam's pitch), not in the depth test.
 
 Tools added (Aurora 0223, see its header); `LM_FRAME_DUMP_ALPHA=1` writes the EFB alpha of each
 dumped frame as `.a.pgm`.

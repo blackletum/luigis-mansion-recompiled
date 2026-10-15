@@ -1,10 +1,11 @@
-Draw debug tools (WIP, flashlight-cone investigation)
+Draw debug tools (flashlight-cone investigation)
 
 AURORA_DRAW_LOG: EFB copy / pass split events with the command position, at=pass:cmd per draw,
 AURORA_DRAW_LOG_MTX (texture/position/projection matrices), AURORA_DRAW_LOG_VTX (eye-space vertices
 and GX z24 per primitive), AURORA_DRAW_LOG_TEXDIR (I4/I8/IA8 texture dumps), AURORA_DRAW_STOP=<n>|copy
 and AURORA_DRAW_STOP_MATCH (drop the rest of the frame, copies keep the EFB). Skipped draws no longer
-let their later primitives merge into the previous draw. Experiments (env only): AURORA_Z24_EXP,
+let their later primitives merge into the previous draw. AURORA_DRAW_LOG_PIXEL=x,y (with _VTX): every
+triangle covering that EFB pixel with its z24 and Z/alpha/blend state. Experiments (env only):
 AURORA_EXP_SRTG_NOZ, AURORA_EXP_SRTG_NOWRITE, AURORA_EXP_ZFREEZE_LOG.
 
 diff --git a/lib/dolphin/gx/GXFrameBuffer.cpp b/lib/dolphin/gx/GXFrameBuffer.cpp
@@ -133,7 +134,7 @@ index 46914fa..410ca74 100644
    }
    pass->efbBlend6 |= bit;
 diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
-index 6aaafc0..3b7d6b5 100644
+index 6aaafc0..541fa12 100644
 --- a/lib/gx/command_processor.cpp
 +++ b/lib/gx/command_processor.cpp
 @@ -26,6 +26,7 @@
@@ -361,7 +362,7 @@ index 6aaafc0..3b7d6b5 100644
  }
  
  static void size_dynamic_arrays(GXVtxFmt fmt, const u8* vtx, u16 vtxCount, u32 vtxSize) noexcept {
-@@ -1134,6 +1290,51 @@ static bool probe_vertex(GXVtxFmt fmt, const u8* vtx, float pos[3], u32& mtxIdx)
+@@ -1134,6 +1290,140 @@ static bool probe_vertex(GXVtxFmt fmt, const u8* vtx, float pos[3], u32& mtxIdx)
    return false;
  }
  
@@ -372,6 +373,95 @@ index 6aaafc0..3b7d6b5 100644
 +  const auto& dbg = draw_debug();
 +  const u32 frame = sDbgFrame.load(std::memory_order_relaxed);
 +  if (dbg.file == nullptr || frame < dbg.first || frame > dbg.last || vtxSize == 0) {
++    return;
++  }
++  // AURORA_DRAW_LOG_PIXEL=x,y (EFB pixel): every triangle covering that pixel's centre, with its
++  // interpolated GX z24 and the Z/alpha/blend state, so the draw that occludes something is found.
++  static const std::array<float, 2> sPix = [] {
++    std::array<float, 2> p{-1.f, -1.f};
++    if (const char* e = std::getenv("AURORA_DRAW_LOG_PIXEL")) {
++      std::sscanf(e, "%f,%f", &p[0], &p[1]);
++    }
++    return p;
++  }();
++  if (sPix[0] >= 0.f) {
++    const auto& P = g_gxState.proj;
++    const auto& vp = g_gxState.logicalViewport;
++    std::vector<std::array<float, 3>> sv(vtxCount); // window x, y, z24
++    std::vector<bool> ok(vtxCount);
++    for (u32 v = 0; v < vtxCount; ++v) {
++      float p[3];
++      u32 mi = 0;
++      ok[v] = probe_vertex(fmt, vtx + v * vtxSize, p, mi);
++      if (!ok[v]) {
++        continue;
++      }
++      if (mi >= MaxPnMtx) {
++        mi = 0;
++      }
++      const auto& M = g_gxState.pnMtx[mi].pos;
++      const float e[3] = {M.m0[0] * p[0] + M.m0[1] * p[1] + M.m0[2] * p[2] + M.m0[3],
++                          M.m1[0] * p[0] + M.m1[1] * p[1] + M.m1[2] * p[2] + M.m1[3],
++                          M.m2[0] * p[0] + M.m2[1] * p[1] + M.m2[2] * p[2] + M.m2[3]};
++      const float cx = P.m0[0] * e[0] + P.m0[1] * e[1] + P.m0[2] * e[2] + P.m0[3];
++      const float cy = P.m1[0] * e[0] + P.m1[1] * e[1] + P.m1[2] * e[2] + P.m1[3];
++      const float cz = P.m2[0] * e[0] + P.m2[1] * e[1] + P.m2[2] * e[2] + P.m2[3];
++      const float cw = P.m3[0] * e[0] + P.m3[1] * e[1] + P.m3[2] * e[2] + P.m3[3];
++      if (!(cw > 1e-4f)) {
++        ok[v] = false;
++        continue;
++      }
++      sv[v] = {vp.left + (cx / cw * 0.5f + 0.5f) * vp.width, vp.top + (0.5f - cy / cw * 0.5f) * vp.height,
++               (vp.zfar + (vp.zfar - vp.znear) * cz / cw) * 16777215.f};
++    }
++    const auto tri = [&](u32 a, u32 b, u32 c) {
++      if (!ok[a] || !ok[b] || !ok[c]) {
++        return;
++      }
++      const float px = sPix[0] + 0.5f, py = sPix[1] + 0.5f;
++      const auto& A = sv[a];
++      const auto& B = sv[b];
++      const auto& C = sv[c];
++      const float d = (B[0] - A[0]) * (C[1] - A[1]) - (C[0] - A[0]) * (B[1] - A[1]);
++      if (std::abs(d) < 1e-6f) {
++        return;
++      }
++      const float wb = ((px - A[0]) * (C[1] - A[1]) - (C[0] - A[0]) * (py - A[1])) / d;
++      const float wc = ((B[0] - A[0]) * (py - A[1]) - (px - A[0]) * (B[1] - A[1])) / d;
++      const float wa = 1.f - wb - wc;
++      if (wa < 0.f || wb < 0.f || wc < 0.f) {
++        return;
++      }
++      const float z = wa * A[2] + wb * B[2] + wc * C[2];
++      const auto& st = g_gxState;
++      std::fprintf(dbg.file,
++                   "F%u PIXEL hit (next D%u) prim=%d n=%u z24=%.0f winding=%s z=%d/%d/%d zloc=%d cull=%d blend=%d "
++                   "%d/%d cupd=%d aupd=%d acmp=%d %d op%d %d %d\n",
++                   frame, sDbgDraw, int(prim), vtxCount, z, d > 0 ? "cw" : "ccw", st.depthCompare ? 1 : 0,
++                   int(st.depthFunc), st.depthUpdate ? 1 : 0, st.zCompLocBeforeTex ? 1 : 0, int(st.cullMode),
++                   int(st.blendMode), int(st.blendFacSrc), int(st.blendFacDst), st.colorUpdate ? 1 : 0,
++                   st.alphaUpdate ? 1 : 0, int(st.alphaCompare.comp0), int(st.alphaCompare.ref0),
++                   int(st.alphaCompare.op), int(st.alphaCompare.comp1), int(st.alphaCompare.ref1));
++    };
++    switch (prim) {
++    case GX_TRIANGLES:
++      for (u32 i = 0; i + 2 < vtxCount; i += 3) tri(i, i + 1, i + 2);
++      break;
++    case GX_TRIANGLESTRIP:
++      for (u32 i = 0; i + 2 < vtxCount; ++i) tri(i, i + 1, i + 2);
++      break;
++    case GX_TRIANGLEFAN:
++      for (u32 i = 1; i + 1 < vtxCount; ++i) tri(0, i, i + 1);
++      break;
++    case GX_QUADS:
++      for (u32 i = 0; i + 3 < vtxCount; i += 4) {
++        tri(i, i + 1, i + 2);
++        tri(i, i + 2, i + 3);
++      }
++      break;
++    default:
++      break;
++    }
 +    return;
 +  }
 +  static const bool sAll = std::strcmp(std::getenv("AURORA_DRAW_LOG_VTX"), "all") == 0;
@@ -413,7 +503,7 @@ index 6aaafc0..3b7d6b5 100644
  static void probe_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vtx, u32 vtxSize) noexcept {
    const AuroraDrawProbeFn fn = sDrawProbe.load(std::memory_order_relaxed);
    if (fn == nullptr || g_gxState.replayMask || vtxCount == 0) {
-@@ -1214,6 +1415,10 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+@@ -1214,6 +1504,10 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
      UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
    if (sDrawProbe.load(std::memory_order_relaxed) != nullptr)
      UNLIKELY { probe_draw(prim, fmt, vtxCount, reader.data() + reader.offset(), vtxSize); }
@@ -493,21 +583,3 @@ index 2c203af..79a1dad 100644
    g_gxState.numTexGens = reg_get(value, 4, 0);
    g_gxState.numChans = reg_get(value, 3, 4);
    g_gxState.numTevStages = reg_get(value, 4, 10) + 1;
-diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
-index 0b49e05..ba7454e 100644
---- a/lib/gx/shader.cpp
-+++ b/lib/gx/shader.cpp
-@@ -2677,7 +2677,12 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
-     fragmentReturn = "\n    return FragmentOutput(vec4f(prev.rgb, 1.0), prev);";
-   }
- 
--  if (info.usesZTex) {
-+  static const bool sZ24Exp = std::getenv("AURORA_Z24_EXP") != nullptr;
-+  const bool z24exp = sZ24Exp && !info.usesZTex && config.lineMode == 0 && !config.lightDepth;
-+  if (z24exp) {
-+    fragmentFn += "\n    let ztex_depth = 1.0 - f32(u32(clamp(1.0 - in.pos.z, 0.0, 1.0) * 16777215.0)) / 16777215.0;";
-+  }
-+  if (info.usesZTex || z24exp) {
-     // Add the depth output to whichever output form was chosen above.
-     if (dstAlphaMode == DstAlphaMode::DualSource) {
-       fragmentOutput =
