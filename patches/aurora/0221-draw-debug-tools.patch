@@ -1,0 +1,513 @@
+Draw debug tools (WIP, flashlight-cone investigation)
+
+AURORA_DRAW_LOG: EFB copy / pass split events with the command position, at=pass:cmd per draw,
+AURORA_DRAW_LOG_MTX (texture/position/projection matrices), AURORA_DRAW_LOG_VTX (eye-space vertices
+and GX z24 per primitive), AURORA_DRAW_LOG_TEXDIR (I4/I8/IA8 texture dumps), AURORA_DRAW_STOP=<n>|copy
+and AURORA_DRAW_STOP_MATCH (drop the rest of the frame, copies keep the EFB). Skipped draws no longer
+let their later primitives merge into the previous draw. Experiments (env only): AURORA_Z24_EXP,
+AURORA_EXP_SRTG_NOZ, AURORA_EXP_SRTG_NOWRITE, AURORA_EXP_ZFREEZE_LOG.
+
+diff --git a/lib/dolphin/gx/GXFrameBuffer.cpp b/lib/dolphin/gx/GXFrameBuffer.cpp
+index 34fa8e5..fd73520 100644
+--- a/lib/dolphin/gx/GXFrameBuffer.cpp
++++ b/lib/dolphin/gx/GXFrameBuffer.cpp
+@@ -8,10 +8,12 @@
+ #include "../../window.hpp"
+ #include "../../webgpu/gpu.hpp"
+ #include "../../gx/texture.hpp"
++#include "../../gx/command_processor.hpp"
+ #include "../vi/vi_internal.hpp"
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdio>
+ 
+ namespace {
+ aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
+@@ -58,9 +60,21 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
+   }
+   auto& handle = it->second;
+ 
++  if (fifo::draw_debug_copy_clear_blocked(g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight, u32(texCopyFmt))) {
++    clear = GX_FALSE;
++  }
+   const auto clearColor = clear && g_gxState.colorUpdate;
+   const auto clearAlpha = clear && g_gxState.alphaUpdate && efb_has_alpha(g_gxState.pixelFmt);
+   const auto clearDepth = clear && g_gxState.depthUpdate;
++  {
++    char note[192];
++    std::snprintf(note, sizeof(note), "COPY dest=%p src=(%d,%d %dx%d) dst=%ux%u fmt=%d clear=%d/%d/%d pix=%d",
++                  dest, int(g_gxState.texCopySrc.x), int(g_gxState.texCopySrc.y), int(g_gxState.texCopySrc.width),
++                  int(g_gxState.texCopySrc.height), unsigned(g_gxState.texCopyDstWidth),
++                  unsigned(g_gxState.texCopyDstHeight), int(texCopyFmt), clearColor ? 1 : 0, clearAlpha ? 1 : 0,
++                  clearDepth ? 1 : 0, int(g_gxState.pixelFmt));
++    fifo::draw_debug_event(note);
++  }
+   // EFB copy to RAM: the copy's bytes at `dest` (native size), for textures/CPU reading them.
+   gfx::set_next_resolve_op(gfx::efb_ram::on_copy(dest, texCopyFmt, g_gxState.texCopyDstWidth,
+                                                  g_gxState.texCopyDstHeight, handle.handle));
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index 46914fa..410ca74 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -21,6 +21,7 @@
+ #include "../window.hpp"
+ 
+ #include <array>
++#include <cstdio>
+ #include <cstring>
+ #include <new>
+ #include <optional>
+@@ -440,7 +441,8 @@ OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height) {
+ 
+ void enqueue_pass(FramePacket& frame, uint32_t passIndex);
+ 
+-void resume_efb_pass_loading(const RenderPass& prevPass) {
++void resume_efb_pass_loading(const RenderPass& prevPass, const char* why = "?") {
++  gx::fifo::draw_debug_event(why);
+   RenderPass newPass{
+       .label = pass_label("EFB"),
+       .colorAttachments = prevPass.colorAttachments,
+@@ -498,6 +500,7 @@ void finish_current_offscreen() {
+ }
+ 
+ void start_offscreen(uint32_t width, uint32_t height) {
++  gx::fifo::draw_debug_event("OFFSCREEN start");
+   AURORA_ASSERT(width != 0 && height != 0, "start_offscreen requires nonzero dimensions ({}x{})", width, height);
+   AURORA_ASSERT(g_recorder.active(), "start_offscreen called outside of an active recording frame");
+ 
+@@ -530,6 +533,7 @@ void start_offscreen(uint32_t width, uint32_t height) {
+ }
+ 
+ void restore_efb() {
++  gx::fifo::draw_debug_event("RESTORE efb");
+   AURORA_ASSERT(g_recorder.active(), "restore_efb called outside of an active recording frame");
+   AURORA_ASSERT(g_recorder.inOffscreen, "restore_efb called without a suspended EFB pass");
+ 
+@@ -570,6 +574,11 @@ void enqueue_op(FramePacket& frame, uint32_t opIndex) {
+ }
+ 
+ void enqueue_pass(FramePacket& frame, uint32_t passIndex) {
++  {
++    char note[96];
++    std::snprintf(note, sizeof(note), "ENQUEUE pass %u (%zu cmds)", passIndex, current_render_passes()[passIndex].commands.size());
++    gx::fifo::draw_debug_event(note);
++  }
+   seal_pass(frame, passIndex);
+   const auto opIndex = static_cast<uint32_t>(frame.ops.size());
+   frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::RenderPass, passIndex));
+@@ -1053,7 +1062,7 @@ bool push_scene_op(SceneOp op) {
+   // The op must run even when the pass itself drew nothing.
+   prevPass.discardable = false;
+   enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+-  resume_efb_pass_loading(prevPass);
++  resume_efb_pass_loading(prevPass, "PASS scene_op");
+   return true;
+ }
+ 
+@@ -1221,7 +1230,7 @@ bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out) {
+   // without a consumer.
+   prevPass.discardable = !prevPass.has_consumer() && !prevPass.has_content();
+   enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+-  resume_efb_pass_loading(prevPass);
++  resume_efb_pass_loading(prevPass, "PASS resolve_pass");
+   return true;
+ }
+ 
+@@ -1272,7 +1281,7 @@ bool push_encoder_task(EncoderTaskId type, const void* payload, size_t payloadSi
+   frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::EncoderTask, taskIndex));
+   enqueue_op(frame, opIndex);
+ 
+-  resume_efb_pass_loading(prevPass);
++  resume_efb_pass_loading(prevPass, "PASS encoder_task");
+   return true;
+ }
+ 
+@@ -1286,7 +1295,7 @@ void note_efb_blend6(bool dither) noexcept {
+   // draws changes, the EFB pass is split so each part is quantized with its own.
+   if (pass->efbBlend6 != 0 && (pass->efbBlend6 & bit) == 0 && !g_recorder.inOffscreen && !pass->sealed) {
+     enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+-    resume_efb_pass_loading(current_render_passes()[g_recorder.currentRenderPass]);
++    resume_efb_pass_loading(current_render_passes()[g_recorder.currentRenderPass], "PASS blend6");
+     pass = &g_recorder.passes()[g_recorder.currentRenderPass];
+   }
+   pass->efbBlend6 |= bit;
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index 6aaafc0..3b7d6b5 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -26,6 +26,7 @@
+ #include <cstdio>
+ #include <cstdint>
+ #include <cstdlib>
++#include <cstring>
+ #include <span>
+ #include <string>
+ #include <vector>
+@@ -583,7 +584,8 @@ static const DrawDebug& draw_debug() noexcept {
+         pos = bar + 1;
+       }
+     }
+-    r.any = r.file != nullptr || !r.skip.empty() || !r.match.empty();
++    r.any = r.file != nullptr || !r.skip.empty() || !r.match.empty() || std::getenv("AURORA_DRAW_STOP") != nullptr ||
++            std::getenv("AURORA_DRAW_STOP_MATCH") != nullptr;
+     return r;
+   }();
+   return d;
+@@ -593,6 +595,60 @@ static std::string dbg_color(const Vec4<float>& c) {
+                      int(std::round(c.z() * 255.f)), int(std::round(c.w() * 255.f)));
+ }
+ // Returns true when the draw is to be skipped.
++// AURORA_DRAW_STOP=<n>: in the logged frames, draws from ordinal n on are dropped and EFB copies
++// no longer clear, so the displayed frame shows the EFB as it was after draw n-1.
++// AURORA_DRAW_STOP=copy: stop at the frame's first full-size (640x480) copy instead.
++static bool sDbgStopHit = false;
++bool draw_debug_stopped(u32 idx) noexcept {
++  static const u32 sStop = [] {
++    const char* p = std::getenv("AURORA_DRAW_STOP");
++    if (p != nullptr && std::strcmp(p, "copy") == 0) {
++      return UINT32_MAX - 1;
++    }
++    if (p == nullptr && std::getenv("AURORA_DRAW_STOP_MATCH") != nullptr) {
++      return UINT32_MAX - 1;
++    }
++    return p ? static_cast<u32>(std::strtoul(p, nullptr, 10)) : UINT32_MAX;
++  }();
++  if (sStop == UINT32_MAX) {
++    return false;
++  }
++  const auto& dbg = draw_debug();
++  const u32 frame = sDbgFrame.load(std::memory_order_relaxed);
++  if (frame < dbg.first || frame > dbg.last) {
++    return false;
++  }
++  return sStop == UINT32_MAX - 1 ? sDbgStopHit : idx >= sStop;
++}
++
++bool draw_debug_copy_clear_blocked(u32 width, u32 height, u32 fmt) noexcept {
++  static const bool sAtCopy = [] {
++    const char* p = std::getenv("AURORA_DRAW_STOP");
++    return p != nullptr && std::strcmp(p, "copy") == 0;
++  }();
++  if (sAtCopy && width == 640 && height == 480 && fmt == GX_TF_RGB565) {
++    const auto& dbg = draw_debug();
++    const u32 frame = sDbgFrame.load(std::memory_order_relaxed);
++    if (frame >= dbg.first && frame <= dbg.last) {
++      sDbgStopHit = true;
++    }
++  }
++  return draw_debug_stopped(sDbgDraw);
++}
++
++void draw_debug_event(const char* text) noexcept {
++  const auto& dbg = draw_debug();
++  if (dbg.file == nullptr) {
++    return;
++  }
++  const u32 frame = sDbgFrame.load(std::memory_order_relaxed);
++  if (frame < dbg.first || frame > dbg.last) {
++    return;
++  }
++  const auto [cpass, ccmd] = gfx::next_command_position();
++  std::fprintf(dbg.file, "F%u after D%d at=%u:%u: %s\n", frame, int(sDbgDraw) - 1, cpass, ccmd, text);
++}
++
+ static bool draw_debug_note(const PipelineConfig& pc, GXPrimitive prim, u16 vtxCount) noexcept {
+   const auto& dbg = draw_debug();
+   if (!dbg.any) {
+@@ -603,8 +659,25 @@ static bool draw_debug_note(const PipelineConfig& pc, GXPrimitive prim, u16 vtxC
+     return false;
+   }
+   const u32 idx = sDbgDraw++;
+-  bool skip = std::find(dbg.skip.begin(), dbg.skip.end(), idx) != dbg.skip.end();
+-  if (dbg.file == nullptr && dbg.match.empty()) {
++  bool skip = std::find(dbg.skip.begin(), dbg.skip.end(), idx) != dbg.skip.end() || draw_debug_stopped(idx);
++  // AURORA_DRAW_STOP_MATCH=<a>[&<b>...]: stop (as AURORA_DRAW_STOP) at the first draw of the frame
++  // whose log entry contains all parts.
++  static const std::vector<std::string> sStopMatch = [] {
++    std::vector<std::string> parts;
++    if (const char* p = std::getenv("AURORA_DRAW_STOP_MATCH")) {
++      std::string all = p;
++      size_t q = 0;
++      while (q <= all.size()) {
++        const size_t amp = std::min(all.find('&', q), all.size());
++        if (amp > q) {
++          parts.push_back(all.substr(q, amp - q));
++        }
++        q = amp + 1;
++      }
++    }
++    return parts;
++  }();
++  if (dbg.file == nullptr && dbg.match.empty() && sStopMatch.empty()) {
+     return skip;
+   }
+   const auto& sc = pc.shaderConfig;
+@@ -614,6 +687,10 @@ static bool draw_debug_note(const PipelineConfig& pc, GXPrimitive prim, u16 vtxC
+                               st.logicalViewport.top, st.logicalViewport.width, st.logicalViewport.height,
+                               st.logicalScissor.x, st.logicalScissor.y, st.logicalScissor.width,
+                               st.logicalScissor.height);
++  {
++    const auto [cpass, ccmd] = gfx::next_command_position();
++    s += fmt::format(" at={}:{}", cpass, ccmd);
++  }
+   s += fmt::format("\n  blend={} src={} dst={} lop={} z={}/{}/{} cupd={} aupd={} dstA={} acmp={} {} op{} {} {} zloc={} "
+                    "cull={} pix={} dither={} fog={}",
+                    underlying(pc.blendMode), underlying(pc.blendFacSrc), underlying(pc.blendFacDst),
+@@ -664,6 +741,76 @@ static bool draw_debug_note(const PipelineConfig& pc, GXPrimitive prim, u16 vtxC
+     s += fmt::format("\n  tg{} type={} src={} mtx={} post={} norm={} su={}x{}", i, underlying(t.type),
+                      underlying(t.src), underlying(t.mtx), underlying(t.postMtx), t.normalize ? 1 : 0,
+                      st.texCoordScales[i].scaleS + 1, st.texCoordScales[i].scaleT + 1);
++    static const bool sMtx = std::getenv("AURORA_DRAW_LOG_MTX") != nullptr;
++    const u32 m = underlying(t.mtx);
++    if (sMtx && m >= GX_TEXMTX0 && m < GX_IDENTITY) {
++      const auto& x = st.texMtxs[(m - GX_TEXMTX0) / 3];
++      s += fmt::format(" M=[{:.4g} {:.4g} {:.4g} {:.4g} | {:.4g} {:.4g} {:.4g} {:.4g} | {:.4g} {:.4g} {:.4g} {:.4g}]",
++                       x.m0.x(), x.m0.y(), x.m0.z(), x.m0.w(), x.m1.x(), x.m1.y(), x.m1.z(), x.m1.w(), x.m2.x(),
++                       x.m2.y(), x.m2.z(), x.m2.w());
++    }
++  }
++  if (std::getenv("AURORA_DRAW_LOG_MTX") != nullptr) {
++    const auto& p = st.pnMtx[st.currentPnMtx / 3].pos;
++    const auto& v = st.logicalViewport;
++    s += fmt::format("\n  pos=[{:.4g} {:.4g} {:.4g} {:.4g} | {:.4g} {:.4g} {:.4g} {:.4g} | {:.4g} {:.4g} {:.4g} {:.4g}] "
++                     "proj type={} z=[{:.6g} {:.6g} {:.6g} {:.6g}] vpz={:.6g}..{:.6g}",
++                     p.m0.x(), p.m0.y(), p.m0.z(), p.m0.w(), p.m1.x(), p.m1.y(), p.m1.z(), p.m1.w(), p.m2.x(),
++                     p.m2.y(), p.m2.z(), p.m2.w(), int(st.projType), st.proj.m2.x(), st.proj.m2.y(), st.proj.m2.z(),
++                     st.proj.m2.w(), v.znear, v.zfar);
++  }
++  // AURORA_DRAW_LOG_TEXDIR=<dir>: the I4/I8/IA8 textures of logged draws as .pgm files (intensity;
++  // IA8 also its alpha), named by data address, once each.
++  if (const char* texDir = std::getenv("AURORA_DRAW_LOG_TEXDIR")) {
++    static std::vector<const void*> sDumped;
++    for (u32 i = 0; i < MaxTextures; ++i) {
++      const auto& tex = st.textures[i];
++      if (!tex || tex.texObj.data == nullptr) {
++        continue;
++      }
++      const u32 f = tex.texObj.format(), w = tex.texObj.width(), h = tex.texObj.height();
++      if ((f != GX_TF_I4 && f != GX_TF_I8 && f != GX_TF_IA8) || w > 1024 || h > 1024 ||
++          std::find(sDumped.begin(), sDumped.end(), tex.texObj.data) != sDumped.end()) {
++        continue;
++      }
++      sDumped.push_back(tex.texObj.data);
++      const u8* d = static_cast<const u8*>(tex.texObj.data);
++      const u32 bw = f == GX_TF_I4 ? 8 : f == GX_TF_I8 ? 8 : 4, bh = f == GX_TF_I4 ? 8 : 4;
++      const u32 bpp4 = f == GX_TF_I4 ? 1 : f == GX_TF_I8 ? 2 : 4; // 4-bit units per texel
++      std::vector<u8> img(size_t(w) * h * 2);
++      const u32 blocksX = (w + bw - 1) / bw;
++      for (u32 y = 0; y < h; ++y) {
++        for (u32 x = 0; x < w; ++x) {
++          const u32 block = (y / bh) * blocksX + x / bw;
++          const u32 in = (y % bh) * bw + x % bw;
++          const u32 nib = block * 64 + in * bpp4; // 32-byte blocks = 64 nibbles
++          u8 iv = 0, av = 255;
++          if (f == GX_TF_I4) {
++            const u8 b = d[nib / 2];
++            const u8 n = (nib & 1) ? (b & 15) : (b >> 4);
++            iv = u8(n * 17);
++          } else if (f == GX_TF_I8) {
++            iv = d[nib / 2];
++          } else {
++            av = d[nib / 2];
++            iv = d[nib / 2 + 1];
++          }
++          img[(size_t(y) * w + x) * 2] = iv;
++          img[(size_t(y) * w + x) * 2 + 1] = av;
++        }
++      }
++      const std::string base = fmt::format("{}/tex_{}_{}x{}_f{}", texDir, tex.texObj.data, w, h, f);
++      for (int ch = 0; ch < (f == GX_TF_IA8 ? 2 : 1); ++ch) {
++        if (FILE* fp = std::fopen((base + (ch == 0 ? ".pgm" : ".a.pgm")).c_str(), "wb")) {
++          std::fprintf(fp, "P5\n%u %u\n255\n", w, h);
++          for (size_t k = 0; k < size_t(w) * h; ++k) {
++            std::fputc(img[k * 2 + ch], fp);
++          }
++          std::fclose(fp);
++        }
++      }
++      s += fmt::format("\n  dumped tex{} -> {}", i, base);
++    }
+   }
+   for (u32 i = 0; i < MaxTextures; ++i) {
+     const auto& tex = st.textures[i];
+@@ -686,6 +833,12 @@ static bool draw_debug_note(const PipelineConfig& pc, GXPrimitive prim, u16 vtxC
+       skip = true;
+     }
+   }
++  if (!sStopMatch.empty() && !sDbgStopHit &&
++      std::all_of(sStopMatch.begin(), sStopMatch.end(),
++                  [&](const std::string& part) { return s.find(part) != std::string::npos; })) {
++    sDbgStopHit = true;
++    skip = true;
++  }
+   if (dbg.file != nullptr) {
+     std::fprintf(dbg.file, "%s%s\n", skip ? "SKIPPED " : "", s.c_str());
+   }
+@@ -954,6 +1107,8 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+       .dstAlpha = state.dstAlpha,
+   };
+   if (draw_debug_note(cache.config, prim, vtxCount)) [[unlikely]] {
++    // The dropped draw's later primitives must not merge into the previous (other) draw's command.
++    cache.lastDrawFmt = static_cast<GXVtxFmt>(0xFF);
+     return;
+   }
+   // 0190: smoothed EFB (bit 16) leaves the blend result unquantized (no 6-bit resolve of the pass).
+@@ -1015,6 +1170,7 @@ void reset_dynamic_arrays() noexcept {
+     std::fflush(draw_debug().file);
+   }
+   sDbgDraw = 0;
++  sDbgStopHit = false;
+ }
+ 
+ static void size_dynamic_arrays(GXVtxFmt fmt, const u8* vtx, u16 vtxCount, u32 vtxSize) noexcept {
+@@ -1134,6 +1290,51 @@ static bool probe_vertex(GXVtxFmt fmt, const u8* vtx, float pos[3], u32& mtxIdx)
+   return false;
+ }
+ 
++// AURORA_DRAW_LOG_VTX=1 (with AURORA_DRAW_LOG): every primitive of the logged frames with its
++// vertices in eye space and their window depth (GX 24-bit z), for SRTG (colour texgen) draws only
++// unless the value is "all".
++static void draw_debug_vertices(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vtx, u32 vtxSize) noexcept {
++  const auto& dbg = draw_debug();
++  const u32 frame = sDbgFrame.load(std::memory_order_relaxed);
++  if (dbg.file == nullptr || frame < dbg.first || frame > dbg.last || vtxSize == 0) {
++    return;
++  }
++  static const bool sAll = std::strcmp(std::getenv("AURORA_DRAW_LOG_VTX"), "all") == 0;
++  if (!sAll) {
++    bool srtg = false;
++    for (u32 i = 0; i < g_gxState.numTexGens; ++i) {
++      srtg = srtg || g_gxState.tcgs[i].type == GX_TG_SRTG;
++    }
++    if (!srtg) {
++      return;
++    }
++  }
++  std::string s = fmt::format("F{} PRIM {} n={} (next D{})", frame, int(prim), vtxCount, sDbgDraw);
++  const auto& P = g_gxState.proj;
++  const u32 n = std::min<u32>(vtxCount, 64u);
++  for (u32 v = 0; v < n; ++v) {
++    float p[3];
++    u32 mi = 0;
++    if (!probe_vertex(fmt, vtx + v * vtxSize, p, mi)) {
++      continue;
++    }
++    if (mi >= MaxPnMtx) {
++      mi = 0;
++    }
++    const auto& M = g_gxState.pnMtx[mi].pos;
++    const float e[3] = {M.m0[0] * p[0] + M.m0[1] * p[1] + M.m0[2] * p[2] + M.m0[3],
++                        M.m1[0] * p[0] + M.m1[1] * p[1] + M.m1[2] * p[2] + M.m1[3],
++                        M.m2[0] * p[0] + M.m2[1] * p[1] + M.m2[2] * p[2] + M.m2[3]};
++    const float z = P.m2[0] * e[0] + P.m2[1] * e[1] + P.m2[2] * e[2] + P.m2[3];
++    const float w = P.m3[0] * e[0] + P.m3[1] * e[1] + P.m3[2] * e[2] + P.m3[3];
++    const auto& vp = g_gxState.logicalViewport;
++    // GX window z: zfar + (zfar - znear) * z / w, in 24-bit units
++    const float zw = (vp.zfar + (vp.zfar - vp.znear) * (w != 0.f ? z / w : 0.f)) * 16777215.f;
++    s += fmt::format("\n    v{} m{} eye=({:.1f},{:.1f},{:.1f}) z24={:.0f}", v, mi, e[0], e[1], e[2], zw);
++  }
++  std::fprintf(dbg.file, "%s\n", s.c_str());
++}
++
+ static void probe_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* vtx, u32 vtxSize) noexcept {
+   const AuroraDrawProbeFn fn = sDrawProbe.load(std::memory_order_relaxed);
+   if (fn == nullptr || g_gxState.replayMask || vtxCount == 0) {
+@@ -1214,6 +1415,10 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+     UNLIKELY { handle_draw_overrun(totalVtxBytes, reader); }
+   if (sDrawProbe.load(std::memory_order_relaxed) != nullptr)
+     UNLIKELY { probe_draw(prim, fmt, vtxCount, reader.data() + reader.offset(), vtxSize); }
++  static const bool sLogVtx = std::getenv("AURORA_DRAW_LOG_VTX") != nullptr;
++  if (sLogVtx) [[unlikely]] {
++    draw_debug_vertices(prim, fmt, vtxCount, reader.data() + reader.offset(), vtxSize);
++  }
+ 
+   size_dynamic_arrays(fmt, reader.data() + reader.offset(), vtxCount, vtxSize);
+ 
+diff --git a/lib/gx/command_processor.hpp b/lib/gx/command_processor.hpp
+index b5b5656..bcc7e60 100644
+--- a/lib/gx/command_processor.hpp
++++ b/lib/gx/command_processor.hpp
+@@ -16,5 +16,9 @@ ProcessResult process(const uint8_t* data, uint32_t size) noexcept;
+ void clear_draw_cache() noexcept;
+ // Forgets this frame's uploads of dynamically sized vertex arrays (see size_dynamic_arrays).
+ void reset_dynamic_arrays() noexcept;
++// AURORA_DRAW_LOG: notes a non-draw event (EFB copy) between the draws of a logged frame.
++void draw_debug_event(const char* text) noexcept;
++// AURORA_DRAW_STOP: true once the logged frame reached the stop ordinal (copies keep the EFB).
++bool draw_debug_copy_clear_blocked(uint32_t width, uint32_t height, uint32_t fmt) noexcept;
+ 
+ } // namespace aurora::gx::fifo
+diff --git a/lib/gx/gx.cpp b/lib/gx/gx.cpp
+index 62113ea..b31ed57 100644
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -677,6 +677,24 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
+       .alphaUpdate = alphaUpdate,
+       .colorUpdate = g_gxState.colorUpdate,
+   };
++  {
++    static const bool sExp = std::getenv("AURORA_EXP_SRTG_NOZ") != nullptr;
++    static const bool sExpNoWrite = std::getenv("AURORA_EXP_SRTG_NOWRITE") != nullptr;
++    if (sExp || sExpNoWrite) {
++      for (u32 i = 0; i < g_gxState.numTexGens; ++i) {
++        if (g_gxState.tcgs[i].type == GX_TG_SRTG) {
++          if (sExp) {
++            config.depthCompare = false;
++          }
++          if (sExpNoWrite) {
++            config.colorUpdate = false;
++            config.alphaUpdate = false;
++            config.dstAlpha = UINT32_MAX;
++          }
++        }
++      }
++    }
++  }
+   config.shaderConfig.enhClass =
+       gfx::enhanced::shader_class(config.shaderConfig, g_gxState.drawClass, config.blendMode != GX_BM_NONE,
+                                   config.blendMode == GX_BM_BLEND && config.blendFacDst == GX_BL_ONE);
+diff --git a/lib/gx/regs.cpp b/lib/gx/regs.cpp
+index 2c203af..79a1dad 100644
+--- a/lib/gx/regs.cpp
++++ b/lib/gx/regs.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include <bit>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ 
+ namespace aurora::gx::fifo {
+ namespace {
+@@ -68,6 +70,12 @@ GXPixelFmt decode_pixel_fmt(u32 peCtrl, u32 cmode1) noexcept {
+ 
+ // genMode (0x00)
+ void bp_gen_mode(u8, u32 value) noexcept {
++  if (reg_get(value, 1, 19) != 0 && std::getenv("AURORA_EXP_ZFREEZE_LOG") != nullptr) {
++    static int sCount = 0;
++    if (sCount++ < 20) {
++      std::fprintf(stderr, "[zfreeze] genmode %06X\n", value);
++    }
++  }
+   g_gxState.numTexGens = reg_get(value, 4, 0);
+   g_gxState.numChans = reg_get(value, 3, 4);
+   g_gxState.numTevStages = reg_get(value, 4, 10) + 1;
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index 0b49e05..ba7454e 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -2677,7 +2677,12 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+     fragmentReturn = "\n    return FragmentOutput(vec4f(prev.rgb, 1.0), prev);";
+   }
+ 
+-  if (info.usesZTex) {
++  static const bool sZ24Exp = std::getenv("AURORA_Z24_EXP") != nullptr;
++  const bool z24exp = sZ24Exp && !info.usesZTex && config.lineMode == 0 && !config.lightDepth;
++  if (z24exp) {
++    fragmentFn += "\n    let ztex_depth = 1.0 - f32(u32(clamp(1.0 - in.pos.z, 0.0, 1.0) * 16777215.0)) / 16777215.0;";
++  }
++  if (info.usesZTex || z24exp) {
+     // Add the depth output to whichever output form was chosen above.
+     if (dstAlphaMode == DstAlphaMode::DualSource) {
+       fragmentOutput =

@@ -2557,3 +2557,27 @@ wall lighting next to the foyer candelabras stepping at the game frame. Not inve
   visible changes, so they were left to the quality presets.
 - The 6-bit resolve (0176) could avoid its full-target copy only with in-place read-modify-write
   (framebuffer fetch / read-write storage on RGBA8), which WebGPU does not offer on D3D12.
+
+## Flashlight cone meets the floor (investigation in progress)
+
+User report: in vanilla rendering the game's cone mesh (`handlight_ef`) ends in a hard line where it
+enters the floor; console/Dolphin show it fading into the floor. Findings so far (foyer, US,
+`LM_TEST_STATE=poltergust LM_START_APPEAR=6`, C-stick aiming the beam down-left):
+
+- The cone is a real 3D fan (apex at the lens, a ring of vertices ~400 units out), additive
+  (SRCALPHA, ONE), Z LEQUAL without update, Z before texturing, dst alpha 255, alpha from a colour
+  texgen (SRTG) lookup of the lit COLOR0 into a 64x64 diagonal ramp; its other maps are a beam-shape
+  gradient (btk scroll), a view-space projected dust texture and a noise texture. Nothing in its
+  material reads depth.
+- The hard line is a depth clip: with the cone's Z test disabled (`AURORA_EXP_SRTG_NOZ=1`) the beam
+  continues smoothly over the floor like the console shot. Bisecting with `AURORA_DRAW_SKIP` puts
+  the occluder in the main pass's first ~650 room draws (the foyer floor area).
+- Not the cause (no visible change at native resolution): 24-bit Z quantization of every draw
+  (`AURORA_Z24_EXP=1`), early-Z cut-out depth (`early_z_alpha_depth=false`), 6-bit blending, colour
+  depth, integer TEV, GX zfreeze/coplanar (never enabled by LM), fog (never used).
+- Debug-tool artifact found and fixed: a draw dropped by `AURORA_DRAW_SKIP`/`_MATCH` let the same
+  draw's later primitives merge into the previous draw's command (drawn with the wrong state). That
+  is what looked like "the cone's alpha removes a blue tint" in earlier experiments.
+
+Tools added (Aurora 0221, see its header); `LM_FRAME_DUMP_ALPHA=1` writes the EFB alpha of each
+dumped frame as `.a.pgm`.

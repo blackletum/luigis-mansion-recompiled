@@ -129,6 +129,25 @@ void writePpmPath(const u8* gx, u32 w, u32 h, const char* path) {
         std::fwrite(rgb.data(), 1, rgb.size(), f);
         std::fclose(f);
     }
+    // LM_FRAME_DUMP_ALPHA=1: the EFB alpha as <name>.a.pgm next to it (debugging passes that
+    // read destination alpha).
+    static const bool sAlpha = std::getenv("LM_FRAME_DUMP_ALPHA") != nullptr;
+    if (sAlpha) {
+        std::vector<u8> a(size_t(w) * h);
+        for (u32 y = 0; y < h; y++)
+            for (u32 x = 0; x < w; x++) {
+                const u32 tile = (y / 4) * tilesPerRow + x / 4;
+                const u32 t = (y % 4) * 4 + x % 4;
+                a[size_t(y) * w + x] = gx[tile * 64 + t * 2];
+            }
+        std::string ap = path;
+        if (ap.size() > 4) ap.replace(ap.size() - 4, 4, ".a.pgm");
+        if (FILE* f = std::fopen(ap.c_str(), "wb")) {
+            std::fprintf(f, "P5\n%u %u\n255\n", w, h);
+            std::fwrite(a.data(), 1, a.size(), f);
+            std::fclose(f);
+        }
+    }
 }
 
 void onWriteback(const void* dest, u32 size, u32, u32 w, u32 h, void*) {
