@@ -1,0 +1,166 @@
+0222: EFB copy readbacks: check the memory as the game left it when it issued the copy
+
+Bug (user crash, 2026-10-14, LM at 120 fps interpolation with a busy CPU): a readback of an EFB copy
+was written into memory whenever that memory still matched what Aurora saw when it executed the copy.
+With frame interpolation Aurora executes a frame's copies at the frame's first replay, on the render
+thread, while the game already runs ahead; on a starved CPU that replay can come well after the game
+issued the copy. At a map change the game frees the old map's buffers (the 640x480 Z16 shadow map
+copy, 600 KB, read back every frame) and loads the new map into the same heap: the late copy then
+hashed the new contents as "before the copy", the readback landed, and the old depth map was written
+over the new map's data (logged 14 times in 40 warps in a starved test run).
+
+aurora_efb_ram_guest_copy(dest, w, h, fmt), called by the game thread at GXCopyTex, records the hash
+of the range at that moment; the readback's pre-copy hash is that one (the host hash stays the
+fallback for copies the game did not announce). A writeback lands only if the game has not written
+the range since issuing the copy (or the memory is still our previous writeback), which is the state
+the console would be in. Stats: staleSkipped (readbacks the old check would have written over new
+contents), lateChanged; both also logged (first 20).
+
+--- a/include/aurora/efb_ram.h
++++ b/include/aurora/efb_ram.h
+@@ -20,6 +20,11 @@
+   uint32_t cpuOverwrites; // copies dropped because the CPU/DMA overwrote their memory
+   uint64_t hashedBytes;   // memory hashed for write detection
+   uint64_t cpuNs;         // CPU time spent in copy tracking, texture resolves and writebacks
++  uint32_t staleSkipped;  // readbacks dropped because the CPU wrote the range after the guest issued
++                          // the copy but before Aurora executed it (lagging replay; would have
++                          // overwritten memory the game had reused)
++  uint32_t lateChanged;   // read-back copies whose range the game wrote between issuing the copy and
++                          // Aurora executing it
+ } AuroraEfbRamStats;
+ 
+ /** Enables accurate copies (default on). Off: copies stay GPU-only (Aurora's original behaviour). */
+@@ -35,6 +40,15 @@
+ /** The CPU is about to read [ptr, ptr+size) (e.g. DCInvalidateRange): copies there are read back
+  *  into memory from now on, and readbacks that already finished are applied. */
+ void aurora_efb_ram_cpu_read(const void* ptr, uint32_t size);
++/** The game issues GXCopyTex(dest) with this destination size and format (call it on the game's
++ *  thread, in order with its memory writes, before GXCopyTex). Aurora executes the copy later
++ *  (another thread; with frame interpolation a replay of the frame can come several game frames
++ *  later), and a readback may only land if the game has not written the range since it issued
++ *  the copy: on the console the copy lands right away and anything the game writes afterwards
++ *  stays. Without this the check uses the memory as Aurora found it when executing the copy, so a
++ *  late copy into a buffer the game had freed and reused (e.g. for heap blocks) was written over
++ *  the new contents. */
++void aurora_efb_ram_guest_copy(const void* dest, uint32_t width, uint32_t height, uint32_t format);
+ /** Always read back copies overlapping [ptr, ptr+size) (e.g. a debug capture buffer). */
+ void aurora_efb_ram_watch(const void* ptr, uint32_t size);
+ /** Writes finished readbacks into memory. Returns how many were written. */
+--- a/lib/gfx/efb_ram.cpp
++++ b/lib/gfx/efb_ram.cpp
+@@ -282,7 +282,9 @@
+   GXTexFmt fmt = GX_TF_I8;
+   uint32_t width = 0;
+   uint32_t height = 0;
+-  HashType preHash = 0;
++  HashType preHash = 0;   // memory when the game issued the copy (aurora_efb_ram_guest_copy), else hostHash
++  HashType hostHash = 0;  // memory when Aurora executed the copy
++  bool guestKnown = false;
+   uint64_t seq = 0;
+   bool ok = false;
+ };
+@@ -338,6 +340,17 @@
+ std::mutex g_poolMutex;  // readback buffer pool (leaf lock, no Dawn call under it)
+ std::vector<std::pair<wgpu::Buffer, uint32_t>> g_readbackPool; // buffer, size
+ absl::flat_hash_map<const uint8_t*, std::pair<uint32_t, HashType>> g_written; // our last writeback per dest
++// Memory at each destination when the game issued its newest copy there (aurora_efb_ram_guest_copy),
++// newest last. Aurora executes the copy later on another thread (a frame-interpolation replay can
++// be game frames behind, more so on a busy CPU), when the game may have freed and reused the range.
++struct GuestCopy {
++  const uint8_t* dest;
++  uint32_t size;
++  HashType hash;
++  std::chrono::steady_clock::time_point when; // diagnostics: how late Aurora executes it
++};
++std::vector<GuestCopy> g_guestCopies;
++constexpr size_t MaxGuestCopies = 128;
+ uint64_t g_seq = 0;
+ AuroraEfbRamStats g_stats{};
+ AuroraEfbRamWritebackFn g_writebackFn = nullptr;
+@@ -719,13 +732,42 @@
+ 
+   ++g_stats.readbacks;
+   auto encode = make_encode_op(e);
++  // The writeback may only land if the game has not written the range since it issued the copy.
++  // e.ramHash is the memory now, which can already hold what the game put there after the copy
++  // (it freed the buffer and the heap reused it while this frame waited for its replay).
++  HashType preHash = e.ramHash;
++  bool guestKnown = false;
++  for (auto it = g_guestCopies.rbegin(); it != g_guestCopies.rend(); ++it) {
++    if (it->dest == dest && it->size == size) {
++      preHash = it->hash;
++      guestKnown = true;
++      const double lagMs =
++          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - it->when).count();
++      static double s_maxLagMs = 100.0;
++      if (lagMs > s_maxLagMs) {
++        s_maxLagMs = lagMs;
++        Log.info("read-back EFB copy to {} (+{:#x}) executed {:.0f} ms after the game issued it",
++                 static_cast<const void*>(dest), size, lagMs);
++      }
++      const auto ours = g_written.find(dest);
++      const bool oursNow = ours != g_written.end() && ours->second.first == size && ours->second.second == e.ramHash;
++      if (preHash != e.ramHash && !oursNow && ++g_stats.lateChanged <= 20) {
++        Log.info("EFB copy to {} (+{:#x}) executed {:.0f} ms after the game issued it; the game wrote the range "
++                 "in between",
++                 static_cast<const void*>(dest), size, lagMs);
++      }
++      break;
++    }
++  }
+   auto rb = std::make_shared<Readback>(Readback{
+       .dest = dest,
+       .size = size,
+       .fmt = fmt,
+       .width = width,
+       .height = height,
+-      .preHash = e.ramHash,
++      .preHash = preHash,
++      .hostHash = e.ramHash,
++      .guestKnown = guestKnown,
+       .seq = e.seq,
+   });
+   return [encode = std::move(encode), bytes = e.bytes, rb](const wgpu::CommandEncoder& cmd,
+@@ -1024,6 +1066,26 @@
+   aurora_efb_ram_apply();
+ }
+ 
++void aurora_efb_ram_guest_copy(const void* ptr, uint32_t width, uint32_t height, uint32_t format) {
++  const auto fmt = static_cast<GXTexFmt>(format);
++  if (!enabled() || !supports_copy_format(fmt) || width == 0 || height == 0) {
++    return;
++  }
++  const auto size = static_cast<uint32_t>(GXGetTexBufferSize(width, height, fmt, GX_FALSE, 0));
++  if (size == 0) {
++    return;
++  }
++  const auto* dest = static_cast<const uint8_t*>(ptr);
++  std::lock_guard lock{g_mutex};
++  const CpuTimer timer;
++  const aurora::HashType h = hash_range(dest, size);
++  std::erase_if(g_guestCopies, [&](const GuestCopy& g) { return g.dest == dest; });
++  if (g_guestCopies.size() >= MaxGuestCopies) {
++    g_guestCopies.erase(g_guestCopies.begin());
++  }
++  g_guestCopies.push_back({dest, size, h, std::chrono::steady_clock::now()});
++}
++
+ void aurora_efb_ram_watch(const void* ptr, uint32_t size) {
+   std::lock_guard lock{g_mutex};
+   g_watchRanges.emplace_back(static_cast<const uint8_t*>(ptr), size);
+@@ -1064,6 +1126,15 @@
+         wrote = true;
+       } else {
+         ++g_stats.skipped;
++        if (rb->guestKnown && now == rb->hostHash) {
++          // Unchanged since Aurora executed the copy, but changed since the game issued it: the
++          // range was reused in between. Before aurora_efb_ram_guest_copy this was written over.
++          if (++g_stats.staleSkipped <= 20) {
++            Log.warn("late EFB copy readback to {} (+{:#x}) dropped: the game wrote the range after issuing the "
++                     "copy (writing it would have overwritten the new contents)",
++                     static_cast<const void*>(dest), rb->size);
++          }
++        }
+       }
+     }
+     if (wrote && g_writebackFn != nullptr) {

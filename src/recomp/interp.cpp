@@ -102,6 +102,10 @@ struct Patch {
     u64 group = 0;      // TagFrame::group: values of one model instance switch together
     u16 clrOffset = 0xFFFF;  // Verts: a direct colour in each vertex (blended unless it jumps)
     u8 clrBytes = 0;
+    // 2D blocks (role 2): position format (0x100 | type | frac << 3) and direct texture coordinates.
+    u8 uvBytes = 0;
+    u16 posFmt = 0;
+    u16 uvOffset = 0xFFFF;
 };
 
 using M34 = std::array<f32, 12>;
@@ -161,6 +165,7 @@ struct Tape {
     std::vector<u64> lightKeys;               // per extra light (flattened, command order): identity, 0 none
     u32 dumpOffset = ~0u;  // LM_INTERP_TEST: tape offset of the LM_FRAME_DUMP copy's target pointer
     u32 dumpFrame = 0;
+    u32 gameFrame = 0;  // GXCopyDisp count + 1 when captured (LM_FRAME_DUMP / LM_INTERP_DRAWS numbering; logs)
     u32 guestUs = 0;  // guest-thread time spent closing the tape (array copies' bookkeeping, pairing)
     // Breakdown of guestUs: array bookkeeping, tape copy, pairing, -, cut check.
     u32 phaseUs[5] = {};
@@ -345,6 +350,7 @@ void judderLine(const char* fmt, ...) {
 }
 u32 sCrossCamera = 0;
 u64 sArraysBlended = 0;  // CPU-deformed position arrays blended (stats window)
+u64 sProjShared = 0;  // unpaired projections given the blended values of an identical one (per stats window)
 u64 sXlPaired = 0, sXlNew = 0, sXlJumped = 0;  // extra lights per stats window: blended / without partner / identity jumped  // per replay: values whose partner was drawn under another camera (trace)
 u32 sSnapKinds[kKinds];
 bool sLogSnaps = false;  // LM_INTERP_TEST + trace: log what one test replay snapped
@@ -1164,6 +1170,7 @@ void endTape(u32 retraceCount) {
     }
     auto tape = std::make_shared<Tape>();
     tape->seq = ++sSeq;
+    tape->gameFrame = copyDispCount() + 1;
     tape->bytes.assign(sScratch.begin(), sScratch.begin() + size);
     tape->patches = std::move(sPatches);
     sPatches = {};
@@ -1298,10 +1305,13 @@ void noteExtraLights(u32 at, u32 count) {
 
 namespace {
 int sNoBlend = 0;
+int sFrameLock = 0;  // text boxes: nothing noted (matrices, colours, 2D vertex blocks, position arrays)
 int sLinearPos = 0;
 }  // namespace
 void pushNoBlend() { sNoBlend++; }
 void popNoBlend() { sNoBlend = sNoBlend > 0 ? sNoBlend - 1 : 0; }
+void pushFrameLock() { sFrameLock++; }
+void popFrameLock() { sFrameLock = sFrameLock > 0 ? sFrameLock - 1 : 0; }
 void pushLinearPosMtx() { sLinearPos++; }
 void popLinearPosMtx() { sLinearPos = sLinearPos > 0 ? sLinearPos - 1 : 0; }
 
@@ -1414,7 +1424,7 @@ u64 valueKey(Kind kind, u32 source, u32 slot, TagCat& cat) {
 }
 
 void note(u32 at, Kind kind, u32 source, u32 slot, int nFloats, int first) {
-    if (at == ~0u || !capturing() || sNoBlend > 0) return;
+    if (at == ~0u || !capturing() || sNoBlend + sFrameLock > 0) return;
     if (sLinearPos > 0 && kind == Kind::PosMtx) kind = Kind::TexMtx;  // element-wise, own key
     // Aurora writes XF loads as 0x10, a u32 header, then the values.
     if (at + 5 + 4 * u32(first + nFloats) > sBase + AuroraCapturePos() || sScratch[at] != 0x10) return;
@@ -1485,7 +1495,7 @@ void noteColor(u32 off, u16 format, u32 reg, u32 light = 0) {
 }
 
 void noteColors(u32 at, u32 lightObj) {
-    if (at == ~0u || !capturing() || sNoBlend > 0) return;
+    if (at == ~0u || !capturing() || sNoBlend + sFrameLock > 0) return;
     const u32 end = sBase + AuroraCapturePos();
     u32 light = 0;  // the Light value just noted for lightObj (index + 1)
     if (lightObj && !sPatches.empty() && sPatches.back().kind == Kind::Light && sPatches.back().source == lightObj)
@@ -1519,7 +1529,7 @@ void noteColors(u32 at, u32 lightObj) {
 
 namespace detail {
 void noteDrawColor(u32 at, u32 reg, u8 type) {
-    if (at == ~0u || !capturing() || sNoBlend > 0 || at + 4 > sBase + AuroraCapturePos()) return;
+    if (at == ~0u || !capturing() || sNoBlend + sFrameLock > 0 || at + 4 > sBase + AuroraCapturePos()) return;
     noteColor(at, type == 3 ? kColorRgba8 : type == 2 ? kColorFog : kColorBp, reg);
 }
 }  // namespace detail
@@ -1569,6 +1579,132 @@ bool blendColorWord(u16 format, const u8* a, const u8* b, float t, u8* out) {
     return true;
 }
 
+namespace {
+// --- 2D pictures whose layout animates ------------------------------------------------------------
+// A 2D quad (direct positions and colours, role 2) paired by identity (structural scope, call site,
+// occurrence, vertex layout, the texture it shows) whose positions changed between the two game
+// frames: a message window opening or closing (fn_80044138's window picture, 480x120, grows from a
+// thin bar to its full height over 3-4 game frames; at 30 Hz its edges stepped 60 px per game frame
+// at 1080p while everything behind it moved smoothly), a panel sliding in. Its positions blend when
+// it is the same picture: every vertex's texture coordinates identical in both frames (a meter that
+// crops its texture, or one glyph paired with another, is not) and at least 48 units across in both
+// frames (text glyphs are smaller: letters appear and lines scroll at the game frame, as on the
+// console), every vertex moving by at most 96 units (a relayout jumps). Positions are s16 in the
+// game's 640x480 layout: the in-betweens move in whole layout units (4.5 px at 2160 lines).
+u32 s2DBlended = 0, s2DKept = 0;  // stats
+FILE* s2DLog = [] {
+    const char* v = std::getenv("LM_2D_LOG");  // per blended picture: tape, alpha, key, bounds a / b / shown
+    return v && *v ? std::fopen(v, "w") : nullptr;
+}();
+const bool s2DOff = [] {
+    const char* v = std::getenv("LM_INTERP_2D_LAYOUT");  // 0: 2D positions always as captured
+    return v && *v == '0';
+}();
+
+f32 load2D(const u8* p, u32 type, u32 frac) {
+    f32 v;
+    switch (type) {
+    case GX_U8: v = f32(p[0]); break;
+    case GX_S8: v = f32(s8(p[0])); break;
+    case GX_U16: v = f32(u16(p[0] << 8 | p[1])); break;
+    case GX_S16: v = f32(s16(p[0] << 8 | p[1])); break;
+    default: return loadBE(p);
+    }
+    return std::ldexp(v, -int(frac));
+}
+void store2D(u8* p, u32 type, u32 frac, f32 v) {
+    if (type == GX_F32) return storeBE(p, v);
+    const long r = std::lround(std::ldexp(v, int(frac)));
+    switch (type) {
+    case GX_U8: p[0] = u8(std::clamp(r, 0L, 255L)); break;
+    case GX_S8: p[0] = u8(s8(std::clamp(r, -128L, 127L))); break;
+    case GX_U16: {
+        const u16 x = u16(std::clamp(r, 0L, 65535L));
+        p[0] = u8(x >> 8), p[1] = u8(x);
+        break;
+    }
+    default: {
+        const u16 x = u16(s16(std::clamp(r, -32768L, 32767L)));
+        p[0] = u8(x >> 8), p[1] = u8(x);
+        break;
+    }
+    }
+}
+}  // namespace
+
+// Blends the positions of 2D block p (tape b) toward its partner q (tape a) into sReplay; false
+// when it is not the same picture moving (then it stays as captured).
+bool blend2DLayout(const Tape& a, const Patch& q, s32 j, const Tape& b, const Patch& p, u32 i, float alpha) {
+    if (s2DOff || !(p.posFmt & 0x100) || q.posFmt != p.posFmt || p.count != q.count || p.count < 3 || !p.uvBytes ||
+        q.uvBytes != p.uvBytes || q.uvOffset != p.uvOffset || q.posOffset != p.posOffset)
+        return false;
+    const u32 type = p.posFmt & 7, frac = (p.posFmt >> 3) & 31;
+    const u32 csize = type == GX_F32 ? 4 : type >= GX_U16 ? 2 : 1;
+    const u32 comps = std::min<u32>(p.source / csize, 3);
+    if (comps < 2) return false;
+    float lo[2][2] = {{1e30f, 1e30f}, {1e30f, 1e30f}}, hi[2][2] = {{-1e30f, -1e30f}, {-1e30f, -1e30f}};
+    float move = 0;
+    for (u32 v = 0; v < p.count; v++) {
+        const u8* va = a.bytes.data() + q.offset + v * q.stride;
+        const u8* vb = b.bytes.data() + p.offset + v * p.stride;
+        if (std::memcmp(va + q.uvOffset, vb + p.uvOffset, p.uvBytes) != 0) {
+            s2DKept++;
+            return false;
+        }
+        for (u32 c = 0; c < comps; c++) {
+            const f32 x = load2D(va + q.posOffset + c * csize, type, frac), y = load2D(vb + p.posOffset + c * csize, type, frac);
+            if (!std::isfinite(x) || !std::isfinite(y)) return false;
+            move = std::max(move, std::fabs(x - y));
+            if (c < 2) {
+                lo[0][c] = std::min(lo[0][c], x), hi[0][c] = std::max(hi[0][c], x);
+                lo[1][c] = std::min(lo[1][c], y), hi[1][c] = std::max(hi[1][c], y);
+            }
+        }
+    }
+    const float extA = std::max(hi[0][0] - lo[0][0], hi[0][1] - lo[0][1]), extB = std::max(hi[1][0] - lo[1][0], hi[1][1] - lo[1][1]);
+    if (!(extA >= 48.0f && extB >= 48.0f && move <= 96.0f)) {
+        s2DKept++;
+        return false;
+    }
+    // A picture that changes size animates (opening, closing, pulsing). One that only moves
+    // blends when it moved the same way in the game frame before (sliding in): a single jump to
+    // another place (a menu cursor, a relayout) stays a jump, as on the console.
+    const float d[2] = {(lo[1][0] + hi[1][0] - lo[0][0] - hi[0][0]) * 0.5f, (lo[1][1] + hi[1][1] - lo[0][1] - hi[0][1]) * 0.5f};
+    if (b.vertStep) b.vertStep[3 * i].store(d[0], std::memory_order_relaxed), b.vertStep[3 * i + 1].store(d[1], std::memory_order_relaxed);
+    const bool sized = std::fabs((hi[1][0] - lo[1][0]) - (hi[0][0] - lo[0][0])) > 0.5f || std::fabs((hi[1][1] - lo[1][1]) - (hi[0][1] - lo[0][1])) > 0.5f;
+    if (!sized) {
+        const float pd[2] = {a.vertStep ? a.vertStep[3 * j].load(std::memory_order_relaxed) : std::nanf(""),
+                             a.vertStep ? a.vertStep[3 * j + 1].load(std::memory_order_relaxed) : std::nanf("")};
+        const float pl = std::hypot(pd[0], pd[1]), dl = std::hypot(d[0], d[1]);
+        if (!(std::isfinite(pl) && pl > 0.5f && pd[0] * d[0] + pd[1] * d[1] > 0.5f * pl * dl)) {
+            s2DKept++;
+            return false;
+        }
+    }
+    for (u32 v = 0; v < p.count; v++) {
+        const u8* va = a.bytes.data() + q.offset + v * q.stride + q.posOffset;
+        const u8* vb = b.bytes.data() + p.offset + v * p.stride + p.posOffset;
+        u8* out = sReplay.data() + p.offset + v * p.stride + p.posOffset;
+        for (u32 c = 0; c < comps; c++) {
+            const f32 x = load2D(va + c * csize, type, frac), y = load2D(vb + c * csize, type, frac);
+            store2D(out + c * csize, type, frac, x + (y - x) * alpha);
+        }
+    }
+    if (s2DLog) {
+        float lo2[2] = {1e30f, 1e30f}, hi2[2] = {-1e30f, -1e30f};
+        for (u32 v = 0; v < p.count; v++)
+            for (u32 c = 0; c < 2; c++) {
+                const f32 o = load2D(sReplay.data() + p.offset + v * p.stride + p.posOffset + c * csize, type, frac);
+                lo2[c] = std::min(lo2[c], o), hi2[c] = std::max(hi2[c], o);
+            }
+        std::fprintf(s2DLog, "%llu %.3f %016llX a %.1f %.1f %.1f %.1f b %.1f %.1f %.1f %.1f shown %.1f %.1f %.1f %.1f site %08X f%u\n",
+                     (unsigned long long)b.seq, alpha, (unsigned long long)p.key, lo[0][0], lo[0][1], hi[0][0], hi[0][1], lo[1][0],
+                     lo[1][1], hi[1][0], hi[1][1], lo2[0], lo2[1], hi2[0], hi2[1], p.site, b.gameFrame);
+    }
+    s2DBlended++;
+    return true;
+}
+
 void noteShadowLight(const float lightView[12], const float kProj[12], const float kRamp[12]) {
     if (!capturing()) return;
     sShadow.valid = true;
@@ -1606,19 +1742,24 @@ void detail::noteDrawCentre(const float c[3]) {
 }
 
 u64 detail::arrayKey() {
-    if (!capturing()) return 0;
+    if (!capturing() || sFrameLock > 0) return 0;
     TagCat cat;
     return valueKey(Kind::Verts, 0x41525241u, 0, cat) ^ 0xA77A1ull;  // (a pseudo light-like source: own key space)
 }
 
 namespace {
 u64 sVertsKey = 0;
+bool sVertsLocked = false;  // begun inside a text box (pushFrameLock): its vertices are not noted
 TagCat sVertsCat = TagCat::None;
 u32 sVertsSite = 0;
 std::string sVertsChain;
 }  // namespace
 void detail::vertsBegin(bool ortho) {
     if (!capturing()) return;
+    // The block is noted when its vertices are complete, at the next GX call: possibly after the
+    // text box's scope closed (the window's last quad blended while the rest of it was locked).
+    sVertsLocked = sFrameLock > 0;
+    if (sVertsLocked) return;
     sVertsSite = sCallLr;
     sVertsKey = valueKey(Kind::Verts, 0, 0, sVertsCat);
     if (!sVertsKey && ortho) {
@@ -1631,12 +1772,20 @@ void detail::vertsBegin(bool ortho) {
     if (sTagLogFrame != ~0ull) sVertsChain = sTagChain;
 }
 
-void detail::noteVertices(u32 at, u32 count, u32 stride, u32 posOffset, u64 id, u32 clrOffset, u32 clrBytes, u32 posBytes2D) {
-    if (!capturing() || count == 0 || count > 0xFFFF) return;
+void detail::noteVertices(u32 at, u32 count, u32 stride, u32 posOffset, u64 id, u32 clrOffset, u32 clrBytes, u32 posBytes2D,
+                          u32 posFmt2D, u32 uvOffset, u32 uvBytes) {
+    const bool locked = sVertsLocked;
+    sVertsLocked = false;
+    if (locked) sVertsKey = 0;
+    if (!capturing() || locked || count == 0 || count > 0xFFFF) return;
     Patch p{at, u16(count), Kind::Verts};
     p.stride = u16(stride);
     p.posOffset = u16(posOffset);
-    if (posBytes2D) p.role = 2, p.source = posBytes2D;  // 2D: colours only (positions as captured)
+    if (posBytes2D) {
+        p.role = 2, p.source = posBytes2D;  // 2D: colours, and positions of animated pictures (replayPair)
+        p.posFmt = u16(posFmt2D);
+        if (uvBytes && uvOffset + uvBytes <= stride) p.uvOffset = u16(uvOffset), p.uvBytes = u8(uvBytes);
+    }
     if (clrBytes && clrOffset + clrBytes <= stride) p.clrOffset = u16(clrOffset), p.clrBytes = u8(clrBytes);
     // The key was taken at GXBegin (vertsBegin): the scope may have closed by the time the draw's
     // vertices are complete (noted at the next GX call).
@@ -2734,6 +2883,9 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
             s32& m = sBundleToA[p.bundle];
             m = m == -1 ? qb : m == qb ? m : -2;
         }
+        static std::vector<u32> unpairedProj, blendedProj;  // perspective/ortho projections of b by patch index
+        unpairedProj.clear();
+        blendedProj.clear();
         for (u32 i = 0; i < b.patches.size(); i++) {
             const Patch& p = b.patches[i];
             if (p.kind == Kind::Color) {
@@ -2793,6 +2945,11 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 }
                 continue;
             }
+            if (j < 0 && p.kind == Kind::Projection && p.count == 6) {
+                // Resolved after the loop (an identical projection of this frame).
+                unpairedProj.push_back(i);
+                continue;
+            }
             if (j < 0 || cameraOnly) {
                 if (placeUnderCamera(*a, b, p, alpha)) sCamOnly++;
                 continue;
@@ -2811,7 +2968,7 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                 for (u32 v = 0; v < p.count && same; v++)
                     same = std::memcmp(a->bytes.data() + q.offset + v * q.stride + q.posOffset,
                                        b.bytes.data() + p.offset + v * p.stride + p.posOffset, p.source) == 0;
-                if (!same) continue;
+                if (!same && !blend2DLayout(*a, q, j, b, p, i, alpha)) continue;
                 bool jumped = false;
                 for (u32 v = 0; v < p.count && !jumped; v++)
                     for (u32 c = 0; c < p.clrBytes; c++)
@@ -3020,14 +3177,42 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
             }
             for (int k = 0; k < p.count; k++) storeBE(sReplay.data() + p.offset + 4 * k, out[k]);
             sBlended++;
+            if (p.kind == Kind::Projection && p.count == 6) blendedProj.push_back(i);
         }
         sLinearBlend = false;
+        // A projection without a partner that is the very projection of another (blended) one of this
+        // game frame: the camera's, set again inside an effect's scope (fn_801191B4 in the foyer: its
+        // scope's identity alternates between game frames, so it paired only every third one). Left
+        // as b's while everything around it used the blended (zooming) projection, the draws after it
+        // and enhanced lighting's shadow mask (it rebuilds view positions from the depth pre-pass with
+        // the last world draw's projection) disagreed with the rest of the frame: the light of the
+        // foyer's left sconce (20 units in front of the wall) was shadowed out on the wall and table
+        // at the in-betweens of 2 of 3 game frames, fading back in with alpha (16:9 only; with
+        // Original 30 there are no in-betweens). It now gets the same blended values.
+        for (const u32 i : unpairedProj) {
+            const Patch& p = b.patches[i];
+            const u8* pb = b.bytes.data() + p.offset;
+            for (const u32 k : blendedProj) {
+                const Patch& o = b.patches[k];
+                if (std::memcmp(b.bytes.data() + o.offset, pb, 28) != 0) continue;  // 6 values + type
+                std::memcpy(sReplay.data() + p.offset, sReplay.data() + o.offset, 24);
+                sProjShared++;
+                break;
+            }
+        }
     }
     // Extra lights (enhanced lighting): position, radius and intensity blended by id (the
     // enhanced-lighting code's own light identity; colours stay b's). Their positions are in view
     // space (the main camera at capture): blended in world space and seen from the blended main
     // camera; a light without a partner keeps its world place under the blended camera.
     static const bool sNoBlendExtra = std::getenv("LM_INTERP_NOBLEND") && (std::strtoul(std::getenv("LM_INTERP_NOBLEND"), nullptr, 0) & 0x80);  // bit 7: extra lights as captured
+    // Test aid LM_XL_LOG=<file>: every replay's extra lights (identity, paired, intensity a / b / shown).
+    static FILE* sXlLog = [] {
+        const char* v = std::getenv("LM_XL_LOG");
+        return v && *v ? std::fopen(v, "w") : nullptr;
+    }();
+    if (sXlLog) std::fprintf(sXlLog, "P %llu %.3f f%u a %llu lights %zu\n", (unsigned long long)b.seq, alpha, b.dumpFrame,
+                             a ? (unsigned long long)a->seq : 0ull, b.lightKeys.size());
     if (a && alpha < 1.0f && !b.lights.empty() && !sNoBlendExtra) {
         constexpr u32 kWords = GX_AURORA_EXTRA_LIGHT_WORDS;
         auto u32At = [](const u8* p) { return u32(p[0]) << 24 | u32(p[1]) << 16 | u32(p[2]) << 8 | p[3]; };
@@ -3092,6 +3277,12 @@ void replayPair(const Tape* a, const Tape& b, float alpha, void* dump) {
                     }
                 }
                 (paired ? sXlPaired : sXlNew)++;
+                if (sXlLog) {
+                    const f32 ib = loadBE(lb + 28), ia = paired ? loadBE(la + 28) : -1.0f;
+                    std::fprintf(sXlLog, "R %llu %.3f id %08X key %016llX %s Ia %.3f Ib %.3f out %.3f flags %08X mvp %d wa %.1f %.1f %.1f wb %.1f %.1f %.1f\n",
+                                 (unsigned long long)b.seq, alpha, u32At(lb + 36), (unsigned long long)key, paired ? "pair" : "new ", ia, ib,
+                                 paired ? ia + (ib - ia) * alpha : ib, u32At(lb + 32), mvp != nullptr, wa[0], wa[1], wa[2], wb[0], wb[1], wb[2]);
+                }
                 if (!paired) {
                     if (mvp) {  // its world place, seen from the blended camera
                         f32 o[3];
@@ -3397,11 +3588,20 @@ struct Pacer {
     std::deque<u32> steps;
     u64 lastTimed = 0;
     u32 lastStamp = 0;
+    // Phase lock (see pace()): the delay actually used (s, 0: off), between d - 0.25 and d + 1
+    // periods, that keeps the presents halfway between the game-frame changes.
+    double lockD = 0;
+    u32 lockWraps = 0;
 };
 Pacer sPacer;
 const bool sOldPacing = [] {
     const char* v = std::getenv("LM_INTERP_PACING");
     return v && std::strcmp(v, "old") == 0;
+}();
+// LM_PHASE_LOCK=0: no phase lock (presents fall wherever the delay puts them within a game frame).
+const bool sPhaseLock = [] {
+    const char* v = std::getenv("LM_PHASE_LOCK");
+    return !(v && *v == '0');
 }();
 double tapeTime(const Tape& t) {
     for (auto it = sPacer.times.rbegin(); it != sPacer.times.rend(); ++it)
@@ -3472,7 +3672,36 @@ int pace(const std::vector<std::shared_ptr<const Tape>>& q, Clock::time_point no
             if (v <= median + 0.05) hi = std::max(hi, v);  // a load hitch is not the steady delay
         p.d = hi + 0.0015;
     }
-    const double target = p.clk - p.d;
+    // Phase lock. Whatever is shown as the game frame (2D layout, text, anything without a
+    // partner, 30 Hz texture animations) changes at the first present past a tape's time. With n
+    // presents per game frame (120 / 30: 4) a present that falls right at a tape's time decides
+    // by a fraction of a millisecond (the smoothed tape times move by ~1-2 ms) whether a change
+    // shows one present early or late: cadences of 5 and 3 (or 3 and 1 at 60 fps) instead of
+    // 4 and 4, whenever the drift between the game's 29.97 Hz and the display's rate or a change
+    // of the measured delay brings the presents to the tape times (user clip at 60 fps: a text
+    // box opening in steps of 5, 2 and 5 frames of a 120 Hz capture). The delay used (lockD)
+    // follows the phase so that the target stays halfway between tape times: measured on the
+    // target itself (the shown time g glides toward it; measuring g lagged and hunted), kept
+    // between d - 0.25 and d + 1 periods (d has a margin of its own over the slowest recent tape),
+    // moved by a whole period only when d leaves that range (small changes of d no longer move
+    // the target at all). Average extra delay ~0.4 present.
+    double target = p.clk - p.d;
+    if (sPhaseLock && p.steps.size() >= 4 && p.period > 0) {
+        std::vector<u32> st(p.steps.begin(), p.steps.end());
+        std::nth_element(st.begin(), st.begin() + st.size() / 2, st.end());
+        const double step = double(st[st.size() / 2]) * kRetrace;
+        const double n = step / p.period, nr = std::round(n);
+        if (nr >= 2 && nr <= 16 && std::fabs(n - nr) < 0.08) {
+            if (p.lockD <= 0) p.lockD = p.d;
+            const double x = (p.clk - p.lockD - tapeTime(*q.back())) / p.period;
+            p.lockD += (x - std::floor(x) - 0.5) * p.period * 0.1;
+            for (int k = 0; k < 4 && p.lockD < p.d - 0.25 * p.period; k++) p.lockD += p.period, p.lockWraps++;
+            for (int k = 0; k < 4 && p.lockD > p.d + p.period; k++) p.lockD -= p.period, p.lockWraps++;
+            target = p.clk - p.lockD;
+        } else {
+            p.lockD = 0;  // not an integer ratio: the plain delay
+        }
+    }
     const double newest = tapeTime(*q.back());
     if (!p.haveG || std::fabs(target - (p.g + dClk)) > 0.1) {
         if (p.haveG) p.snaps++;
@@ -3577,7 +3806,17 @@ bool replay(bool final) {
                (unsigned long long)(a && !final ? a->seq : 0), alpha,
                a && !final ? double(a->retrace) + alpha * double(b->retrace - a->retrace) : double(b->retrace),
                sPacer.d * 1000.0, sLastPresent.present, (unsigned long long)aurora_frame_counter());
-    replayPair(final ? nullptr : a.get(), *b, alpha, nullptr);
+    // Test aid LM_PRESENT_DUMP=1 (with LM_FRAME_DUMP): every present of the tapes in the dump range as
+    // its own file, f<frame>_p<present>_a<alpha x 1000>.ppm (real time, unlike LM_INTERP_TEST).
+    static const bool sPresentDump = std::getenv("LM_PRESENT_DUMP") != nullptr;
+    void* presentDump = nullptr;
+    if (sPresentDump && b->dumpOffset != ~0u) {
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "f%05u_p%06u_a%04d", b->dumpFrame, sLastPresent.present,
+                      int(std::lround(sLastPresent.alpha * 1000.0f)));
+        presentDump = efbcopy::namedDumpTarget(nm);
+    }
+    replayPair(final ? nullptr : a.get(), *b, alpha, presentDump);
     probeFill(a, b);
     if (sJudder && a && !final && alpha < 1.0f) {
         // V present m[12]: the blended camera of b's main camera (most position matrices), the one
@@ -3633,7 +3872,7 @@ bool replay(bool final) {
         log("[interp] presented %.1f fps, game %.1f fps (shown %.1f), tape %.0f KiB + arrays %.0f KiB + new texture copies %.0f KiB, "
             "per tape %.0f paired / %.0f unpaired / %.0f untagged values; per present %u blended / %u snapped / %u from the newest "
             "frame under the camera; %u cut presents; tape close %.2f ms (guest: arrays %.2f, "
-            "copy %.2f, pairing %.2f, identity check %.2f, cut %.2f), replay %.2f ms (host); shown %.1f ms behind the newest game frame, %u stalls, %u resyncs",
+            "copy %.2f, pairing %.2f, identity check %.2f, cut %.2f), replay %.2f ms (host); shown %.1f ms behind the newest game frame, %u stalls, %u resyncs; phase lock +%.1f ms (%u wraps)",
             sPresented / elapsed, sStatsSeq ? double(sLastPresent.newestSeq - sStatsSeq) / elapsed : 0.0, sTapes / elapsed, sTapes ? double(sTapeBytes) / sTapes / 1024.0 : 0.0,
             sTapes ? double(sArrayBytes) / sTapes / 1024.0 : 0.0, sTapes ? double(sTexBytes) / sTapes / 1024.0 : 0.0,
             sTapes ? double(sPairedSum) / sTapes : 0.0,
@@ -3642,7 +3881,9 @@ bool replay(bool final) {
             sTapes ? double(sPhaseUs[0]) / sTapes / 1000.0 : 0.0, sTapes ? double(sPhaseUs[1]) / sTapes / 1000.0 : 0.0,
             sTapes ? double(sPhaseUs[2]) / sTapes / 1000.0 : 0.0, sTapes ? double(sPhaseUs[3]) / sTapes / 1000.0 : 0.0,
             sTapes ? double(sPhaseUs[4]) / sTapes / 1000.0 : 0.0,
-            sPresented ? double(sReplayUs) / sPresented / 1000.0 : 0.0, sPacer.behindN ? sPacer.behindSum / sPacer.behindN * 1000.0 : 0.0, sPacer.stalls, sPacer.snaps);
+            sPresented ? double(sReplayUs) / sPresented / 1000.0 : 0.0, sPacer.behindN ? sPacer.behindSum / sPacer.behindN * 1000.0 : 0.0, sPacer.stalls, sPacer.snaps,
+            sPacer.lockD > 0 ? (sPacer.lockD - sPacer.d) * 1000.0 : 0.0, sPacer.lockWraps);
+        sPacer.lockWraps = 0;
         sPacer.behindSum = 0;
         sPacer.behindN = 0;
         sPacer.stalls = sPacer.snaps = 0;
@@ -3668,12 +3909,18 @@ bool replay(bool final) {
             log("[interp] extra lights per present: %.1f blended by identity, %.1f without partner (%.2f whose identity jumped >200 units)",
                 double(sXlPaired) / presentedWindow, double(sXlNew) / presentedWindow, double(sXlJumped) / presentedWindow);
         sXlPaired = sXlNew = sXlJumped = 0;
+        if (sProjShared) log("[interp] unpaired projections per present given an identical projection's blend: %.2f", double(sProjShared) / presentedWindow);
+        sProjShared = 0;
         if (sColorsBlended + sColorsSwitched)
             log("[interp] colour registers per present: %.1f blended, %.1f switched (jumped); model instances blended linearly %.1f, "
                 "switched %.1f; particles shown at the game frame (turned back) %.1f",
                 double(sColorsBlended) / presentedWindow, double(sColorsSwitched) / presentedWindow,
                 double(sGroupForced) / presentedWindow, double(sGroupSnaps) / presentedWindow, double(sReversals) / presentedWindow);
         sColorsBlended = sColorsSwitched = sGroupForced = sGroupSnaps = sReversals = 0;
+        if (s2DBlended + s2DKept)
+            log("[interp] 2D pictures that moved, per present: %.2f blended, %.2f as captured (not the same picture, glyph-sized or jumped)",
+                double(s2DBlended) / presentedWindow, double(s2DKept) / presentedWindow);
+        s2DBlended = s2DKept = 0;
         if (sArraysBlended) log("[interp] %.1f CPU-deformed position arrays blended per present", double(sArraysBlended) / presentedWindow);
         sArraysBlended = 0;
         std::fill(std::begin(sPhaseUs), std::end(sPhaseUs), 0ull);

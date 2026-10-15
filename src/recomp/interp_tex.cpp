@@ -43,6 +43,7 @@ std::unordered_map<u64, Entry> sById;    // (object id << 32 | version) | kind b
 std::unordered_map<u64, Entry> sByHash;  // content hash ^ size
 std::vector<Blob> sUsed;                 // this tape's copies
 u32 sTapeNo = 1;
+u32 sMapTexture[8] = {};  // the texture last loaded into each map (address, size, format)
 u64 sCopied = 0;  // bytes copied this tape
 u32 sLoads = 0, sBacked = 0, sSnapped = 0;  // texture loads this tape (LM_INTERP_TRACE)
 
@@ -131,6 +132,8 @@ u32 texSize(u32 w, u32 h, u32 fmt, bool mips) {
 
 }  // namespace
 
+u32 boundTexture(int map) { return sMapTexture[map & 7]; }
+
 void texLoaded(u32 at) {
     if (!capturing()) return;
     u8* c = findAurora(at, GX_AURORA_LOAD_TEXOBJ);
@@ -140,6 +143,7 @@ void texLoaded(u32 at) {
     const u32 w = be32(c + 9), h = be32(c + 13), fmt = be32(c + 17);
     const bool mips = c[25] != 0;
     const u32 id = be32(c + 26), version = be32(c + 30);
+    sMapTexture[c[0] & 7] = phys ^ (w << 20) ^ (h << 8) ^ fmt;
     if (phys == ~0u || id == 0 || w == 0 || h == 0 || w > 1024 || h > 1024) return;
     const u32 size = texSize(w, h, fmt, mips);
     sLoads++;

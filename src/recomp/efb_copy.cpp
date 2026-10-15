@@ -210,15 +210,27 @@ void onFrame(u32 frameNo) {
     if (sLog && frameNo % 300 == 0) {
         AuroraEfbRamStats s;
         aurora_efb_ram_get_stats(&s);
-        log("[efb] f%u copies %u encodes %u decodes %u readbacks %u writebacks %u skipped %u cpu-overwrites %u "
+        log("[efb] f%u copies %u encodes %u decodes %u readbacks %u writebacks %u skipped %u (late %u) cpu-overwrites %u "
             "hashed %.1f MB cpu %.1f ms",
-            frameNo, s.copies, s.encodes, s.decodes, s.readbacks, s.writebacks, s.skipped, s.cpuOverwrites,
+            frameNo, s.copies, s.encodes, s.decodes, s.readbacks, s.writebacks, s.skipped, s.staleSkipped, s.cpuOverwrites,
             double(s.hashedBytes) / 1048576.0, double(s.cpuNs) / 1e6);
     }
 }
 
 void cpuRead(u32 addr, u32 size) {
     if (size) aurora_efb_ram_cpu_read(hostp(addr), size);
+}
+
+// The game issued a texture copy to guest memory. Aurora executes it later on its own thread; with
+// frame interpolation the first replay of the frame (the one that reads its copies back) can come
+// several game frames later, more so when the CPU is busy. A readback used to land whenever the
+// memory still matched what Aurora found when executing the copy, so a buffer the game had freed
+// and reused in the meantime got the old copy written over its new contents (at a map change: the
+// old map's 600 KB Z16 shadow map over the new map's heap data), corrupting game data that crashed
+// the game later (docs/RENDERING.md "Late copy readbacks"). Now the check is against the memory as
+// the game left it when it issued the copy.
+void guestCopy(u32 addr, u32 width, u32 height, u32 fmt) {
+    if (width && height) aurora_efb_ram_guest_copy(hostp(addr), width, height, fmt);
 }
 
 void requestNamedDump(const std::string& path, int shrink, std::function<void(const u8* rgb, u32 w, u32 h)> done) {

@@ -215,6 +215,19 @@ HLE(fn_8002B6D4) {
     if (held) c.r[3] = 0;
 }
 
+// Gallery screen setup (game mode 6), called by the <GALLERY> event tag (event 79) with the
+// trigger's event parameter: 1..23 a portrait plaque in the gallery (map 6), 100 the area-clear
+// screen ("Now you've caught: (Area n) ..."), drawn by fn_8018721C. Test aid
+// LM_GALLERY_PARAM=<n> replaces the parameter, so any plaque opens screen n (e.g. 100).
+HLE(fn_8018712C) {
+    static const int sParam = envInt("LM_GALLERY_PARAM", -1);
+    if (sParam >= 0) {
+        log("[dev] LM_GALLERY_PARAM: gallery screen %d instead of %d", sParam, s32(c.r[3]));
+        c.r[3] = u32(sParam);
+    }
+    callOriginal(c, "fn_8018712C");
+}
+
 // Scene manager, once per main-loop iteration. A queued warp is applied exactly like the
 // event command <WARP>(n): next map = n and the current scene id cleared, so the manager
 // tears the game scene down and sets it up again for the new map on this call. Only while

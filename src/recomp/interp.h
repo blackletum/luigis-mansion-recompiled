@@ -87,6 +87,18 @@ void note(u32 at, Kind kind, u32 source, u32 slot, int nFloats, int first = 0);
 // shadow texture matrices must come from the same frame (shadows.cpp). Nests by count.
 void pushNoBlend();
 void popNoBlend();
+// Text boxes (tags.cpp): everything drawn inside is shown exactly at its game frame, as on the
+// console: no value is noted (matrices, lights, colours, 2D vertex blocks and their colours, CPU
+// position arrays), so the box, its text and the portrait/icons in it step together at 30 Hz
+// instead of a smoothly opening box with letters appearing at the game rate. Nests by count.
+void pushFrameLock();
+void popFrameLock();
+struct FrameLockScope {
+    FrameLockScope() { pushFrameLock(); }
+    ~FrameLockScope() { popFrameLock(); }
+    FrameLockScope(const FrameLockScope&) = delete;
+    FrameLockScope& operator=(const FrameLockScope&) = delete;
+};
 // While set, position matrices are blended linearly (element-wise, like projection-style texture
 // matrices) instead of rigidly: the shadow map's caster pass, so the in-between shadow map matches
 // the receivers' element-wise blended light projection (shadows.cpp).
@@ -141,6 +153,7 @@ void invalidateVtxCache();                                    // GXInvalidateVtx
 void vtxBegin(u32 prim, u32 fmt, u32 nVerts, bool perspective);  // GXBegin (before Aurora's header)
 void vtxBytes(u32 v, int size);                               // raw FIFO write from game code
 void vtxEnd();  // gx::endPendingDraw: the immediate-mode draw is complete
+u32 drawCount();  // draws captured so far (running count; tags.cpp: did a scope draw anything)
 void vtxDisplayList(u32 guestAddr, const u8* data, u32 size);  // after GXCallDisplayList
 
 // Draw-time vertex array snapshots without interpolation (interp_vtx.cpp; F1 > Visuals >
@@ -161,6 +174,7 @@ bool raceStore(u32 addr, int size);   // every guest store (true: log it) while 
 
 // Textures and TLUTs (interp_tex.cpp): the data a load points at is copied at capture time.
 void texLoaded(u32 at);   // after GXLoadTexObj, marked at `at`
+u32 boundTexture(int map);  // what was last loaded into that texture map (while capturing; 0: none)
 void tlutLoaded(u32 at);  // after GXLoadTlut, marked at `at`
 void efbCopied(u32 guestDest, u32 size);  // GXCopyTex: textures over that memory are not copied
 void efbWrittenBack(const void* dest, u32 size);  // a copy's bytes were written into memory
@@ -225,7 +239,10 @@ inline void noteDrawAlt(u64) {}
 // Immediate-mode vertices with direct f32 XYZ positions: `count` vertices of `stride`
 // bytes starting at tape offset `at`, position at `posOffset` in each.
 void noteVertices(u32 at, u32 count, u32 stride, u32 posOffset, u64 id, u32 clrOffset = 0xFFFF, u32 clrBytes = 0,
-                  u32 posBytes2D = 0);  // posBytes2D: a 2D (orthographic) block of positions that size: colours only
+                  u32 posBytes2D = 0,  // posBytes2D: a 2D (orthographic) block of positions that size
+                  // 2D only: 0x100 | component type | frac << 3 of the positions, and the direct texture
+                  // coordinates (offset, bytes): a picture whose layout animates blends its positions.
+                  u32 posFmt2D = 0, u32 uvOffset = 0xFFFF, u32 uvBytes = 0);
 void vertsBegin(bool ortho = false);  // at GXBegin of such a draw: its identity (tag scope, call site)
 u64 mix(u64 h);
 // A display list or stream wrote XF matrix memory directly (judder detector's slot table).

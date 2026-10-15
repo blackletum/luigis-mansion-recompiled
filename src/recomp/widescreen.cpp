@@ -15,6 +15,9 @@
 
 namespace recomp {
 u32 copyDispCount();  // hle_gx.cpp
+namespace tags {
+bool textBoxShown();  // tags.cpp: a message window is on screen
+}
 }
 #include <cmath>
 #include <vector>
@@ -149,15 +152,25 @@ RenderToTextureScope::~RenderToTextureScope() { sRttDepth--; }
 
 // Game Boy Horror (bottom right): frame, LEDs and the J2DScreen of whatever its screen
 // shows (money tally, E. Gadd's call, the cut E3 clock).
+// Frame interpolation: while a message window is on screen the GBH is shown at the game frame like
+// the text box (interp::FrameLockScope; tags.cpp fn_80044138): during E. Gadd's call it is his call
+// window, shaking as the call comes in, with his portrait on its screen.
 HLE(fn_8003D634) {
     AnchorScope s(1);
+    const bool call = interp::capturing() && tags::textBoxShown();
+    if (call) interp::pushFrameLock();
     callOriginal(c, "fn_8003D634");
+    if (call) interp::popFrameLock();
 }
 // The static noise drawn over the GBH screen (gbnoise01..03), from the HUD and from the
 // GBH view's own pass (fn_8003E7B0(1)).
 HLE(fn_8003BE9C) {
     AnchorScope s(1);
+    // The noise as E. Gadd's call connects belongs to his call window (fn_8003D634 above).
+    const bool call = interp::capturing() && tags::textBoxShown();
+    if (call) interp::pushFrameLock();
     callOriginal(c, "fn_8003BE9C");
+    if (call) interp::popFrameLock();
 }
 // Sets up view n of the frame loop: its viewport/scissor (and for view 1 the depth-clear
 // quad, fn_8000B228) are set here, and the view's draws that follow use them. View 1 is the
@@ -187,7 +200,13 @@ HLE(fn_80114E18) {
     else if (sLastFrame == ~0u || (frame != sLastFrame && frame != sLastFrame + 1)) sCallAnchored = false;
     sLastFrame = frame;
     AnchorScope s(sCallAnchored ? 1 : 0);
+    // A portrait shown with a message window (E. Gadd's on the GBH during his call) belongs to the
+    // text box: shown at the game frame (interp::FrameLockScope; tags.cpp fn_80044138). Portraits
+    // without text (door close-ups) interpolate.
+    const bool lock = interp::capturing() && tags::textBoxShown();
+    if (lock) interp::pushFrameLock();
     callOriginal(c, "fn_80114E18");
+    if (lock) interp::popFrameLock();
 }
 // The event scene's render-to-texture pass, called by fn_80114E18 between the scene and the
 // portrait draws: when the scene defines a texture target (door scenes: the reflection of
@@ -210,29 +229,97 @@ HLE(fn_8000C598) {
     callOriginal(c, "fn_8000C598");
 }
 // Room name when entering a room: the floor (top right) and the room's name (top left).
+// Frame interpolation: text, shown at the game frame like every text box (tags.cpp fn_80044138).
 HLE(fn_80045BDC) {
     AnchorScope s(kAnchorBySide);
+    interp::FrameLockScope lock;
     callOriginal(c, "fn_80045BDC");
 }
-// ---- scenes kept at 4:3 / widened 2D (widescreen.h) ----
+// ---- widened 2D masks (widescreen.h) ----
 namespace {
-int sLock43Depth = 0;
 int sWipeDepth = 0;
+int sAccountDepth = 0;  // inside fn_80050524 (the area-clear / result screens)
+int sEdgeDepth = 0;     // drawing the area-clear mask screen: pictures reach the display's edges
+
+// Logical pixels between the 4:3 frame's edge and the display's edge (plus a little overlap).
+s32 sideExtent() { return s32(std::ceil(320.0f / factor() - 320.0f)) + 2; }
 }  // namespace
-Lock43Scope::Lock43Scope() { sLock43Depth++; }
-Lock43Scope::~Lock43Scope() { sLock43Depth--; }
-bool lock43() { return sLock43Depth > 0 && active(); }
 WipeScope::WipeScope() { sWipeDepth++; }
 WipeScope::~WipeScope() { sWipeDepth--; }
 bool inWipe() { return sWipeDepth > 0 && active(); }
 
-// Area-clear screen ("Now you've caught: (Area n) ..."): the game-mode 6 draw of the frame loop
-// (fn_8000BE20). Luigi shines the flashlight on the area's portraits on a wall
-// (/Nakamura/gallery.bin) that ends just outside the 4:3 view; Hor+ showed its edge. The scene
-// is kept at 4:3 with black bars; its 2D text is centered as everywhere else.
-HLE(fn_8018721C) {
-    Lock43Scope lock;
-    callOriginal(c, "fn_8018721C");
+// Result screens after the Portrificationizer (event 02's <ACCOUNT>: E. Gadd's lab, map 4):
+// "Now you've caught: (Area n)" with Luigi's flashlight on a yellow wall, "You've caught a total
+// of ...", "You've found:" with the money list. Drawn each frame by this function as 2D in the
+// 640-wide frame, with Luigi as 3D on top (account object r3, state at +1):
+//   - state 0: the iris wipe from the lab, four J2DFillBox boxes around the /timg/ad_wipe_0
+//     circle picture, as in fn_80055C54 (WipeScope);
+//   - states 3..7: a black J2DFillBox, then three J2DScreens from lbl_803CFA50: +8 the wall
+//     (a 1280-wide tiled picture scrolled by the game, so it runs past the 4:3 frame's right
+//     edge), +0 the black mask (a tiled picture over x 0..240 and the round spotlight texture in
+//     two halves over 240..642) with the text, +4 the money list (behind a fading fill).
+// Hor+ showed the wall beside the mask, and in the wipe the lab beside the circle: the mask only
+// covered the 4:3 frame. Inside the mask screen the pictures touching the 4:3 frame's edges are
+// extended to the display's edges (J2DPicture::drawTexCoord below), so the black surround covers
+// any width while the spotlight and the text stay where they are.
+HLE(fn_80050524) {
+    const bool wipe = rd8(c.r[3] + 1) == 0;
+    sAccountDepth++;
+    if (wipe) sWipeDepth++;
+    callOriginal(c, "fn_80050524");
+    if (wipe) sWipeDepth--;
+    sAccountDepth--;
+}
+
+// J2DScreen::draw(screen, x, y, graf): marks the area-clear mask screen (above).
+HLE(draw__9J2DScreenFiiPC14J2DGrafContext) {
+    const bool mask = sAccountDepth > 0 && active() && c.r[3] == rd32(VA(0x803CFA50));
+    if (mask) sEdgeDepth++;
+    callOriginal(c, "draw__9J2DScreenFiiPC14J2DGrafContext");
+    if (mask) sEdgeDepth--;
+}
+
+// J2DPicture::drawTexCoord(this, x, y, w, h, s0, t0, s1, t1, s3, t3, s2, t2, mtx): one quad,
+// corners (x,y) (x+w,y) (x+w,y+h) (x,y+h) with texcoords f1/f2, f3/f4, f7/f8, f5/f6, placed by
+// mtx * the pane's matrix (+0x84). In the mask screen, a quad whose screen-space side lies on
+// the 4:3 frame's left or right edge (or beyond it) is lengthened to the display's edge, its
+// texture coordinates extrapolated along the quad: a tiled (repeat) texture keeps tiling and a
+// clamped one repeats its edge texels, i.e. the black graphic itself continues to the edge.
+HLE(drawTexCoord__10J2DPictureFiiiiffffffffPA3_A4_f) {
+    if (sEdgeDepth > 0 && active()) {
+        const u32 pane = c.r[3], mtx = c.r[8];
+        const s32 x = s32(s16(c.r[4])), w = s32(s16(c.r[6]));
+        // x row of mtx * pane matrix
+        f32 a[4], b[3][4];
+        for (int j = 0; j < 4; j++) a[j] = rdf32(mtx + 4 * j);
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 4; j++) b[i][j] = rdf32(pane + 0x84 + 16 * i + 4 * j);
+        const f32 m00 = a[0] * b[0][0] + a[1] * b[1][0] + a[2] * b[2][0];
+        const f32 m01 = a[0] * b[0][1] + a[1] * b[1][1] + a[2] * b[2][1];
+        const f32 m03 = a[0] * b[0][3] + a[1] * b[1][3] + a[2] * b[2][3] + a[3];
+        if (w > 0 && m00 > 1e-3f && std::fabs(m01) < 1e-4f) {
+            const f32 left = m00 * f32(x) + m03, right = m00 * f32(x + w) + m03;
+            const f32 ext = f32(sideExtent());
+            s32 dl = 0, dr = 0;  // local units added on each side
+            if (left <= 0.5f) dl = s32(std::ceil((left + ext) / m00));
+            if (right >= 640.0f - 0.5f) dr = s32(std::ceil((640.0f + ext - right) / m00));
+            if (dl > 0 || dr > 0) {
+                f32 st[8];
+                for (int i = 0; i < 8; i++) st[i] = f32(c.f[1 + i]);
+                // per local unit along the top (v0 -> v1) and bottom (v3 -> v2) edges
+                const f32 topS = (st[2] - st[0]) / f32(w), topT = (st[3] - st[1]) / f32(w);
+                const f32 botS = (st[6] - st[4]) / f32(w), botT = (st[7] - st[5]) / f32(w);
+                st[0] -= topS * f32(dl), st[1] -= topT * f32(dl);
+                st[4] -= botS * f32(dl), st[5] -= botT * f32(dl);
+                st[2] += topS * f32(dr), st[3] += topT * f32(dr);
+                st[6] += botS * f32(dr), st[7] += botT * f32(dr);
+                for (int i = 0; i < 8; i++) c.setSingle(1 + i, st[i]);
+                c.r[4] = u32(x - dl);
+                c.r[6] = u32(w + dl + dr);
+            }
+        }
+    }
+    callOriginal(c, "drawTexCoord__10J2DPictureFiiiiffffffffPA3_A4_f");
 }
 
 // J2DFillBox(x, y, w, h, color*): inside the iris wipe, a box touching the 4:3 frame's left or
@@ -241,7 +328,7 @@ HLE(fn_8018721C) {
 // relative to the edge it does not touch, so the hole is unchanged.
 HLE(J2DFillBox__FiiiiQ28JUtility6TColor) {
     if (inWipe()) {
-        const s32 ext = s32(std::ceil(320.0f / factor() - 320.0f)) + 2;
+        const s32 ext = sideExtent();
         s32 x = s32(c.r[3]), w = s32(c.r[5]);
         const s32 right = x + w;
         if (x <= 0) {

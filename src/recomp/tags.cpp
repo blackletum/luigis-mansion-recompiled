@@ -329,6 +329,34 @@ HLE(draw__7J2DPaneFiiPC14J2DGrafContextb) {
     callOriginal(c, "draw__7J2DPaneFiiPC14J2DGrafContextb");
 }
 
+// --- text boxes: shown at the game frame ----------------------------------------------------------
+// Every text box is shown exactly as in its game frame, at 30 Hz, as on the console
+// (interp::FrameLockScope; docs/INTERPOLATION.md "Text boxes at the game frame"). The letters appear
+// at the game rate; a box that opened smoothly around them, or moved between presents, made the text
+// jump against it (user report after 4301b1e: "the text on textboxes is still jumpy").
+// fn_80044138, from the frame loop fn_8000BCE8, draws every message window (fn_800433B4): the box
+// picture (fn_8003B054, 480x120, grows open over 3-4 game frames), the speaker icon, the text, the
+// "more" arrow and choices. All dialogue goes through it: Neville, Toad, E. Gadd in the lab and on
+// the Game Boy Horror call, signs. (E. Gadd's call window on the GBH screen: widescreen.cpp
+// fn_8003D634 / fn_80114E18; the room name: fn_80045BDC.)
+namespace {
+u32 sTextBoxFrame = ~0u;  // the game frame (GXCopyDisp count) a message window last drew in
+}  // namespace
+namespace tags {
+// A message window is on screen (drawn in this game frame or the one before; the HUD is drawn
+// before the windows). While one is, the Game Boy Horror and the event portrait belong to the text
+// box too (widescreen.cpp): E. Gadd's call is a message window next to his portrait on the GBH,
+// which shakes as the call comes in (its bezel blended while the screen inside stayed put).
+bool textBoxShown() { return sTextBoxFrame != ~0u && copyDispCount() - sTextBoxFrame <= 1; }
+}  // namespace tags
+HLE(fn_80044138) {
+    if (!interp::capturing()) return callOriginal(c, "fn_80044138");
+    interp::FrameLockScope lock;
+    const u32 draws = interp::drawCount();
+    callOriginal(c, "fn_80044138");
+    if (interp::drawCount() != draws) sTextBoxFrame = copyDispCount();
+}
+
 // --- memory ------------------------------------------------------------------------------------
 // A freed heap block: objects that lived in it get new identities (a new actor allocated at the
 // same address is not the old one).

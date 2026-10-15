@@ -77,19 +77,7 @@ struct RenderToTextureScope {
     RenderToTextureScope& operator=(const RenderToTextureScope&) = delete;
 };
 
-// Scenes kept at 4:3 (guest thread). Inside a Lock43Scope, full-screen 3D draws keep their
-// Hor+ projection but are scissored to the centered 4:3 frame, so the sides stay at the clear
-// colour (black pillarbox bars). Used for the area-clear portrait screen (fn_8018721C), whose
-// wall model ends just outside the 4:3 view.
-struct Lock43Scope {
-    Lock43Scope();
-    ~Lock43Scope();
-    Lock43Scope(const Lock43Scope&) = delete;
-    Lock43Scope& operator=(const Lock43Scope&) = delete;
-};
-bool lock43();  // inside a Lock43Scope and widescreen active
-
-// The iris wipe (fn_80055C54): black boxes around a circle picture, laid out in the 640-wide
+// The iris wipes (fn_80055C54, and the area-clear screens' fn_80050524): black boxes around a circle picture, laid out in the 640-wide
 // 2D frame. Inside a WipeScope (widescreen active) every 2D draw is centered 4:3, and fill
 // boxes that reach the 4:3 frame's left or right edge are extended to the display's edge
 // (J2DFillBox hook), so the mask covers the whole width and the circle stays round.

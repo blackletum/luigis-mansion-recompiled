@@ -40,10 +40,14 @@ StreamSyncCheckReady us pal
 
 # Camera culling planes: widened for the Hor+ widescreen projection (src/recomp/widescreen.cpp).
 fn_80008D58 us pal
-# Widescreen scenes (src/recomp/widescreen.cpp): the area-clear portrait screen is kept at 4:3
-# (black bars), and the iris wipe's side boxes are extended to the display's edges.
-fn_8018721C us pal
+# Widescreen scenes (src/recomp/widescreen.cpp): the iris wipes' side boxes and the area-clear
+# screens' black mask (Portrificationizer result screens) are extended to the display's edges.
+fn_80050524 us pal
+draw__9J2DScreenFiiPC14J2DGrafContext us pal
+drawTexCoord__10J2DPictureFiiiiffffffffPA3_A4_f us pal
 J2DFillBox__FiiiiQ28JUtility6TColor us pal
+# Gallery screen setup: test aid LM_GALLERY_PARAM (src/recomp/dev_tools.cpp).
+fn_8018712C
 
 # Room portal rectangle: re-done with near-plane clipping when the doorway straddles the
 # camera, so the room behind it doesn't vanish (src/recomp/portal_fix.cpp, docs/RENDERING.md).
@@ -108,6 +112,8 @@ fn_800417F8 us pal
 # Game Boy Horror map screen (its frame-loop scene): the map's viewport follows the centered
 # bezel in widescreen (src/recomp/widescreen.cpp).
 fn_8000C598 us pal
+# Message windows (all dialogue): shown at the game frame while interpolating (src/recomp/tags.cpp).
+fn_80044138 us pal
 # Early ghost lighting (cheat-equivalent, src/recomp/unused_content.cpp)
 fn_8005A5D4 us pal
 

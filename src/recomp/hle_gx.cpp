@@ -185,11 +185,10 @@ void emitProjection(ProjMode mode) {
     sProjDirty = false;
 }
 
-// lock3D: a full-screen 3D draw in a scene kept at 4:3 (ws::lock43): centered, never anchored.
-void emitScissor(bool pillar, bool lock3D = false) {
+void emitScissor(bool pillar) {
     sScissorAnchor = 0;
     if (pillar) {
-        sScissorAnchor = sVpFollow ? sVpAnchor : lock3D ? 0 : hudAnchor();
+        sScissorAnchor = sVpFollow ? sVpAnchor : hudAnchor();
         const f32 l = std::max(0.0f, pillarX(f32(sScissor.x), sScissorAnchor));
         const f32 r = std::min(kLogicalWidth, pillarX(f32(sScissor.x + sScissor.w), sScissorAnchor));
         const u32 li = u32(std::max(0.0f, std::floor(l)));
@@ -237,12 +236,9 @@ void prepareDraw(ProjMode mode, const char* what = "draw") {
     const bool hud = mode == ProjMode::Scaled && sProj.type == GX_ORTHOGRAPHIC;
     if (sProjSet && (sProjDirty || mode != sProjEmitted || (hud && hudAnchor() != sProjEmittedAnchor)))
         emitProjection(mode);
-    // A scene kept at 4:3 (ws::lock43, e.g. the area-clear screen): its 3D keeps the Hor+
-    // projection but is scissored to the centered 4:3 frame, leaving black bars at the sides.
-    const bool lock3D = !sVpFollow && mode == ProjMode::Scaled && sProj.type == GX_PERSPECTIVE && ws::lock43();
-    const bool pillar = sVpFollow || lock3D || (hud && (sScissor.x > 0 || sScissor.x + sScissor.w < 640));
-    const int anchor = sVpFollow ? sVpAnchor : lock3D ? 0 : hudAnchor();
-    if (pillar != sScissorPillar || (pillar && anchor != sScissorAnchor)) emitScissor(pillar, lock3D);
+    const bool pillar = sVpFollow || (hud && (sScissor.x > 0 || sScissor.x + sScissor.w < 640));
+    const int anchor = sVpFollow ? sVpAnchor : hudAnchor();
+    if (pillar != sScissorPillar || (pillar && anchor != sScissorAnchor)) emitScissor(pillar);
 }
 
 // Mirror of the vertex layout state that immediate-mode 2D draws use, so a
@@ -734,8 +730,10 @@ void gx::endPendingDraw() {
         const ProjMode mode = classifyHeld();
         prepareDraw(mode, "held");
         sInHeldPrepare = false;
-        HUD_TRACE("held %s x[%.3f,%.3f] mode=%d anchor=%d %s", sHeldDecoded ? "dec" : "nodec", sHeldLo, sHeldHi,
-                  int(mode), sHeldAnchor, sHeldChain.c_str());
+        HUD_TRACE("held %s x[%.3f,%.3f] mode=%d anchor=%d tex %s %s", sHeldDecoded ? "dec" : "nodec", sHeldLo, sHeldHi,
+                  int(mode), sHeldAnchor,
+                  sTevMap[0] < 8 && sMapImage[sTevMap[0]] ? imageDesc(sMapImage[sTevMap[0]]).c_str() : "-",
+                  sHeldChain.c_str());
         sRawCheck = true;
         interp::snapBegin(sHeld.fmt, sHeld.verts);
         GXBegin(sHeld.prim, sHeld.fmt, sHeld.verts);
@@ -1047,7 +1045,6 @@ GXHLE(GXSetScissor) {
     HUD_TRACE("scissor %u %u %u %u %s", c.r[3], c.r[4], c.r[5], c.r[6], guestChain(c).c_str());
     sScissor = {c.r[3], c.r[4], c.r[5], c.r[6]};
     emitScissor(sVpFollow);
-    if (ws::lock43()) sRawCheck = true;  // raw FIFO 3D draws re-apply the 4:3 scissor
 }
 GXHLE(GXSetClipMode) { GXSetClipMode(GXClipMode(c.r[3])); }
 
@@ -1127,7 +1124,8 @@ GXHLE(GXInitTexObj) {
     GXInitTexObj(sTex.forInit(c.r[3], kTexTag), ptr(c.r[4]), u16(c.r[5]), u16(c.r[6]), GXTexFmt(c.r[7]),
                  GXTexWrapMode(c.r[8]), GXTexWrapMode(c.r[9]), GXBool(c.r[10]));
     noteTexImage(c.r[3], c.r[4]);
-    if (indLogOn()) sImageDesc[phys(c.r[4])] = (c.r[5] & 0xFFF) << 20 | (c.r[6] & 0xFFF) << 8 | (c.r[7] & 0xFF);
+    static const bool sHudTraceSet = std::getenv("LM_HUD_TRACE") != nullptr;  // texture sizes in its held lines
+    if (indLogOn() || sHudTraceSet) sImageDesc[phys(c.r[4])] = (c.r[5] & 0xFFF) << 20 | (c.r[6] & 0xFFF) << 8 | (c.r[7] & 0xFF);
     diagTexInit("INIT", c.r[3], c.r[4], c.r[5], c.r[6], c.r[7], c.lr);
 }
 GXHLE(GXInitTexObjCI) {
@@ -1490,6 +1488,7 @@ GXHLE(GXCopyTex) {
         sCopyDests.push_back(phys(c.r[3]));
     }
     interp::efbCopied(c.r[3], GXGetTexBufferSize(u16(sCopyDiag.dw), u16(sCopyDiag.dh), sCopyDiag.fmt, GX_FALSE, 0));
+    efbcopy::guestCopy(c.r[3], sCopyDiag.dw, sCopyDiag.dh, sCopyDiag.fmt);
     GXCopyTex(hostp(c.r[3]), GXBool(c.r[4]));
 }
 

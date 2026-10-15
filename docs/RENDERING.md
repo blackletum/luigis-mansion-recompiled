@@ -237,7 +237,8 @@ else there.
    GPU-written memory visible to the CPU) are encoded and read back into guest memory. The
    readback is asynchronous: the bytes are written at the next guest frame boundary after the GPU
    finishes the frame (1-2 frames after the copy), and only if the memory is unchanged since the
-   copy (or still holds our previous writeback), so a CPU write after the copy is never clobbered.
+   game *issued* the copy (or still holds our previous writeback), so a CPU write after the copy is
+   never clobbered (see "Late copy readbacks" below: Aurora 0222).
    A same-frame synchronous readback would need a mid-frame GPU submit/stall, which Aurora's
    single-encoder frame model doesn't support; LM never reads copy pixels with the CPU, so this
    is not needed here. `LM_EFB_READBACK_ALL=1` reads back every copy (test aid).
@@ -352,6 +353,51 @@ and in `aurora_efb_ram_apply`. The readback pool stores each buffer's size (no `
 pool lock). Same scenario on the fix: 15 min, and Bogmire -> death -> game over -> title twice
 (10 min each, judder log on/off): no stall. (efb_blend6's `AURORA_EFB_BLEND6_TIMING` callback and
 upstream depth_peek still call Dawn in callbacks; both off in LM.)
+
+### Late copy readbacks: memory corruption under a busy CPU (Aurora patch 0222)
+
+User crash (2026-10-14, new game, lab/training and early mansion, 120 fps interpolation, Enhanced
+lighting Ultra, two other games/builds holding the CPU at 100%, game at 21-26 fps): after ~16 min
+`[recomp FATAL] call to 814D6E20: no function starts there (lr=8019C598)`. `lr` is in
+`Jac_UpdateDAC` (JAudio's AI-interrupt work, audio thread): it calls `DAC_CALLBACK_FUNC`
+(`.sbss` 0x804D9324, never set by the game, always null) and that word held 0x814D6E20. For the 1.8 s
+before, the main thread read ~12,300 addresses 0xCC3E493E..0xCC3F698E six bytes apart (a vertex-like
+walk through a pointer that held 0xCC3E49xx). Two unrelated places held junk 16-bit pairs at once:
+game memory had been overwritten, the audio path was only where it surfaced.
+
+Cause: the EFB-copy readback check. The game's 640x480 Z16 shadow-map buffer (0x96000 bytes, heap) is
+copied into every frame and, like the two screen buffers, reused as scratch memory for ARAM/DVD loads
+(the Game Boy Horror archive, see above); once the CPU `DCInvalidateRange`s part of it (the 0x162E0
+range in the user's log: "CPU reads EFB copy memory at ... (+0x162e0)"), every shadow copy is read
+back. A readback landed whenever the memory still matched what Aurora saw when it *executed* the copy.
+With frame interpolation the copies run at the frame's first replay on the render thread while the
+game is already ahead (more so when the host threads are starved); if the game had meanwhile loaded
+something into the buffer or freed it to the next map's heap, Aurora hashed those new contents as the
+"pre-copy" memory, the readback matched, and 600 KB of old depth values were written over the new
+data (the junk pairs above are plausible depth/pixel values). In lockstep (Original 30) Aurora runs
+the copies while the game waits, so the window was only the readback's own 1-2 frames.
+
+Fix (0222): `aurora_efb_ram_guest_copy`, called from the `GXCopyTex` HLE on the game thread before the
+copy is queued (`efbcopy::guestCopy`), records the range's hash as the game left it; the readback's
+pre-copy hash is that one (Aurora's own hash stays the fallback for copies the game did not announce,
+e.g. frame dumps). A writeback lands only if the game has not written the range since issuing the copy
+(or it still holds our previous writeback): the state a console would be in, since its copy lands at
+once and later writes stay. Steady-state readbacks are unchanged (each lands over our previous one).
+
+Evidence (`LM_DEV_WARPS` cycling maps 1/3/2 every 600-700 frames, `LM_TEST_STATE=poltergust`, the
+game pinned to 4 E-cores shared with 4 busy loops, 20 min): with the old check (temporary switch) 14
+late readbacks were written over memory the game had changed after issuing the copy (40 warps), e.g.
+the old map's shadow copy over 0x80FB09E0 right after the warp to map 3; with the fix the same
+situations are logged and dropped, no crash (20 min / 40 warps, and 21 min / 50 warps: 20+ drops
+each; `late EFB copy readback ... dropped`, first 20 shown;
+`[efb] ... (late N)` in `LM_COPY_LOG` stats). The exact user crash needs a particular heap layout and
+was not reproduced; starved runs without warps (foyer, training room, 15-30 min each) never hit the
+window at all, and none of them crashed.
+
+Things ruled out on the way (docs/AUDIO.md pacing, starved runs with `LM_IRQ_STALL`, `LM_AUDIO_LOG`,
+`LM_WATCH=804D9324`): AI interrupt give-ups (up to 175 in 30 min) and JAudio's DSP overload check
+(22,600 forced voice stops in 15 min with a test stall in `DSPReleaseHalt`) degrade the sound but
+never wrote guest memory out of place; no guest store or DVD/ARQ write ever touched 0x804D9324.
 
 ## Vertex snapshots (Luigi's mouth/hose flicker)
 
@@ -1371,6 +1417,28 @@ Test aids: `LM_PIPELINE_LIST=<file>` (a damaged list), `LM_CACHE_DIR=<dir>`; the
 `<cache dir>/pipeline_cache.journal` (u32 magic "AUJN", version, phase 0 clean / 1 startup /
 2 running, consecutive startup crashes, then 64 slots); the `pipeline_bad` table lists recorded
 configs (`reason` 1 = failed creation, 2 = crash suspect, `crashes`).
+
+### Skipped draws are logged; shadow casters wait (Aurora 0221)
+
+Every draw dropped for a missing pipeline is counted. Reasons: creation failed, waiting turned off
+(`LM_PIPELINE_WAIT=0`), or not queued. Logging is always on:
+- every second with a non-zero count, a warning "N draws skipped for a missing pipeline in the
+  last 1.0 s (k shadow casters)";
+- the first skip of each pipeline, one line: "draw skipped:" / "shadow caster skipped:", the
+  pipeline key, the reason, and its config in the MISS format (recorded when a draw asked for the
+  pipeline before it was built; "precache list entry" if none did).
+
+Fix: the light shadow-map casters (`render_casters`) used `try_get_pipeline` and skipped a caster
+whose pipeline was still compiling, so that light had no shadow in that present. They now wait
+like every other draw (the 0013 policy). Reason: the user's foyer capture under 100% CPU load
+alternated between shadowed and unshadowed presents of one candle light (docs/INTERPOLATION.md,
+"Foyer entry flicker report").
+
+Checked:
+- cold cache, `LM_PRECACHE_WAIT=0`, game limited to 2 cores, 60 fps, the foyer intro: 0 skipped
+  draws, the sconce light monotonic present by present;
+- with `LM_PIPELINE_WAIT=0` the log lists the skips (up to 912 per second at startup, 19 distinct
+  pipelines with their configs).
 
 ## Enhanced lighting
 

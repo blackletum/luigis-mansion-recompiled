@@ -1,0 +1,211 @@
+0221: draws skipped for a missing pipeline are logged; shadow casters wait for their pipeline
+
+Every draw dropped because its pipeline is missing (creation failed, LM_PIPELINE_WAIT=0) or still
+compiling (shadow casters, until now) is counted. A warning line "N draws skipped for a missing
+pipeline in the last x s (k shadow casters)" goes to the log every second with a non-zero count, and
+the first skip of each pipeline is logged once with its config: the MISS detail, recorded when a
+draw asks for a pipeline that is not built yet, whether it is precached or not ("precache list
+entry" when no draw asked for it). It is always on. resolve_pipeline clears its thread-local
+config pointers after the lookup, because miss_detail() now always runs. Light shadow-map casters (render_casters)
+took their pipeline with try_get_pipeline and skipped the draw while it compiled, so that light had
+no shadow in that present. They now wait like every other draw (patch 0013 policy). Motivation: a
+user capture under 100% CPU load showed a candle light alternating between shadowed and
+unshadowed presents (docs/INTERPOLATION.md "Foyer entry flicker report").
+
+diff --git a/lib/gfx/enhanced.cpp b/lib/gfx/enhanced.cpp
+index e9adb87..e42a521 100644
+--- a/lib/gfx/enhanced.cpp
++++ b/lib/gfx/enhanced.cpp
+@@ -1684,8 +1684,11 @@ bool init_cube() {
+   return bool(g_gpu.cubePipe);
+ }
+ 
+-// Caster draws into the atlas: like gx::render, but a draw whose pipeline is still compiling is
+-// skipped (its shadow appears a moment later) instead of stalling the frame.
++// Caster draws into the atlas: like gx::render. 0221: a caster whose pipeline is still compiling
++// waits for it like every other draw (patch 0013 policy); it was skipped, which drops its shadow
++// for that frame (a light whose casters compile for many frames under heavy CPU load flickers
++// between shadowed and unshadowed). Skips that remain (creation failed, LM_PIPELINE_WAIT=0) are
++// logged by get_pipeline.
+ void render_casters(const wgpu::RenderPassEncoder& pass, const MaskJob& job, size_t from, uint32_t& drawn,
+                     uint32_t& skipped) {
+   const auto& resources = detail::resources();
+@@ -1696,7 +1699,7 @@ void render_casters(const wgpu::RenderPassEncoder& pass, const MaskJob& job, siz
+       continue;
+     }
+     CompiledPipeline pipeline;
+-    if (!try_get_pipeline(g.lightPipe, pipeline)) {
++    if (!get_pipeline(g.lightPipe, pipeline, "shadow caster")) {
+       ++skipped;
+       continue;
+     }
+diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
+index 2f4754d..6dcacc8 100644
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -72,6 +72,13 @@ static std::atomic<uint32_t> g_seeded{0};
+ static std::atomic_bool g_pipelineLog{false};
+ static std::atomic_bool g_waitForPipelines{true};
+ static std::atomic<uint32_t> g_droppedDraws{0};
++// 0221: draws skipped for a missing pipeline (any pass): counted per second for the log, and the
++// first skip of each pipeline is logged with what is known about its config (the MISS detail of
++// on-demand pipelines, kept for that).
++static std::atomic<uint32_t> g_skipWindow{0}, g_skipWindowCasters{0};
++static std::mutex g_skipMutex;
++static absl::flat_hash_set<PipelineRef> g_skipWarned;
++static absl::flat_hash_map<PipelineRef, std::string> g_missDetails; // under g_pipelineMutex
+ static uint32_t g_requestedThreads = 0;
+ static uint32_t g_workerThreadCount = 0;
+ static std::optional<uint32_t> g_rebuildAccuracy; // GX accuracy flags the known set was last built for
+@@ -615,6 +622,11 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
+           queued = true;
+         }
+       } else {
++        // 0221: a draw needs a pipeline that is still compiling (precached or not): keep its config
++        // for a skipped-draw warning.
++        if (priority != PipelinePriority::Background && g_missDetails.size() < 4096 && !g_missDetails.contains(runtimeKey)) {
++          g_missDetails.emplace(runtimeKey, miss_detail());
++        }
+         promote_pending_pipeline(runtimeKey, priority);
+         notifyWorker = priority != PipelinePriority::Background;
+       }
+@@ -643,8 +655,12 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
+       } else {
+         // A draw needs a pipeline nothing precached: a gap in the precache list.
+         ++g_demandCreated;
++        std::string detail = miss_detail();
+         if (g_pipelineLog.load(std::memory_order_relaxed)) {
+-          Log.info("pipeline {:016x}: MISS (not precached) frame {}{}", runtimeKey, current_frame(), miss_detail());
++          Log.info("pipeline {:016x}: MISS (not precached) frame {}{}", runtimeKey, current_frame(), detail);
++        }
++        if (g_missDetails.size() < 4096) {
++          g_missDetails.insert_or_assign(runtimeKey, std::move(detail)); // 0221: for a skipped-draw warning
+         }
+       }
+       switch (priority) {
+@@ -1024,12 +1040,17 @@ static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& c
+   tl_missConfig = &config;
+   tl_missLayout = &layout;
+   tl_missCacheKey = cacheKey;
+-  return find_pipeline_impl(
++  const PipelineRef ref = find_pipeline_impl(
+       runtimeKey,
+       [type, cacheKey, config, layout] {
+         return guarded_create(type, cacheKey, [&] { return create_pipeline(config, layout); });
+       },
+       priority);
++  // 0221: miss_detail() now runs for every draw that meets a missing pipeline: no pointers to this
++  // call's arguments may outlive it (other find_pipeline overloads use find_pipeline_impl too).
++  tl_missConfig = nullptr;
++  tl_missLayout = nullptr;
++  return ref;
+ }
+ 
+ static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig& config,
+@@ -2081,7 +2102,10 @@ void shutdown_pipeline_cache() {
+   journal_close(); // clean exit
+ }
+ 
++static void log_skipped_draws(); // 0221
++
+ void begin_pipeline_frame() {
++  log_skipped_draws();
+   if (!g_hasPipelineThread) {
+     g_pipelinesPerFrame = 0;
+   }
+@@ -2110,26 +2134,73 @@ bool try_get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {
+   return true;
+ }
+ 
+-bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {
++// 0221: a draw skipped for a missing pipeline: counted (per-second log line in
++// begin_pipeline_frame) and, the first time for this pipeline, a warning with its config.
++static void note_skipped_draw(PipelineRef ref, const char* what, const char* why) {
++  ++g_droppedDraws;
++  ++g_skipWindow;
++  if (std::strcmp(what, "shadow caster") == 0) {
++    ++g_skipWindowCasters;
++  }
++  {
++    std::lock_guard lock{g_skipMutex};
++    if (g_skipWarned.size() >= 4096 || !g_skipWarned.insert(ref).second) {
++      return;
++    }
++  }
++  std::string detail;
++  bool pending = false;
++  {
++    std::lock_guard guard{g_pipelineMutex};
++    if (const auto it = g_missDetails.find(ref); it != g_missDetails.end()) {
++      detail = it->second;
++    }
++    pending = g_pendingPipelines.contains(ref);
++  }
++  Log.warn("{} skipped: pipeline {:016x} {} (frame {}, {}){}", what, ref, why, current_frame(),
++           pending ? "still queued" : "not queued", detail.empty() ? std::string(" config: precache list entry") : detail);
++}
++
++static void log_skipped_draws() {
++  using Clock = std::chrono::steady_clock;
++  static Clock::time_point sWindow = Clock::now();
++  const auto now = Clock::now();
++  const double secs = std::chrono::duration<double>(now - sWindow).count();
++  if (secs < 1.0) {
++    return;
++  }
++  sWindow = now;
++  const uint32_t n = g_skipWindow.exchange(0, std::memory_order_relaxed);
++  const uint32_t casters = g_skipWindowCasters.exchange(0, std::memory_order_relaxed);
++  if (n != 0) {
++    Log.warn("{} draws skipped for a missing pipeline in the last {:.1f} s ({} shadow casters)", n, secs, casters);
++  }
++}
++
++bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline, const char* what) {
++  bool failed = false;
+   {
+     std::lock_guard guard{g_pipelineMutex};
+     const auto it = g_pipelines.find(ref);
+     if (it != g_pipelines.end()) {
+-      if (!it->second.main) {
+-        ++g_droppedDraws; // creation failed
+-        return false;
++      if (it->second.main) {
++        pipeline = it->second;
++        return true;
+       }
+-      pipeline = it->second;
+-      return true;
++      failed = true;
+     }
+   }
++  if (failed) {
++    note_skipped_draw(ref, what, "creation failed"); // (takes g_pipelineMutex itself)
++    return false;
++  }
+   // Not built yet: never drop the draw, wait for it.
+   if (!g_waitForPipelines.load(std::memory_order_relaxed)) {
+-    ++g_droppedDraws;
++    note_skipped_draw(ref, what, "not built yet (waiting off)");
+     return false;
+   }
+   if (!wait_for_pending_pipeline(ref, pipeline)) {
+-    ++g_droppedDraws;
++    note_skipped_draw(ref, what, "not built and not queued, or creation failed");
+     return false;
+   }
+   return true;
+diff --git a/lib/gfx/pipeline_cache.hpp b/lib/gfx/pipeline_cache.hpp
+index 74570cc..488a627 100644
+--- a/lib/gfx/pipeline_cache.hpp
++++ b/lib/gfx/pipeline_cache.hpp
+@@ -41,7 +41,8 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLa
+ PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout);
+ PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
+ 
+-bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
++// 0221: `what` names the draw in the skipped-draw log ("draw", "shadow caster").
++bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline, const char* what = "draw");
+ bool try_get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
+ 
+ // Around shader module creation: false when the module failed to compile (logged). A pipeline
