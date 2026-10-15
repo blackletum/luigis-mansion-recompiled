@@ -2647,5 +2647,5 @@ enters the floor; console/Dolphin show it fading into the floor. Findings so far
   draw's later primitives merge into the previous draw's command (drawn with the wrong state). That
   is what looked like "the cone's alpha removes a blue tint" in earlier experiments.
 
-Tools added (Aurora 0221, see its header); `LM_FRAME_DUMP_ALPHA=1` writes the EFB alpha of each
+Tools added (Aurora 0223, see its header); `LM_FRAME_DUMP_ALPHA=1` writes the EFB alpha of each
 dumped frame as `.a.pgm`.
