@@ -589,6 +589,32 @@ player, `fn_800E71D4` dot product with that Luigi's look direction `[Luigi +0xF1
 Luigis standing together tend to look at each other, so in a test with both standing still the
 ghosts never came out; it is the game's own rule (moving players turn away), not changed.
 
+**The player an object deals with.** Every AI object (EnThought) keeps the index of the player it
+deals with at +0x950; the game reaches that player's Poltergust part (Luigi +0x80C) through
+`fn_800AD39C(index)`. Most objects set it to 0 once, and a lot of object code asks for player 0
+literally (`fn_800AD39C(0)`, `fn_800E9750(0)`, `fn_800AD54C(0, msg)`), so player 2's Poltergust did
+nothing to them: player 2 could not catch Chauncey's balls (`fn_800A30B8` tests player 1's suction),
+Bowser's bombs or Bogmire's shadows, Boolossus followed only player 1's nozzle (his state 7,
+`fn_80137E24`), and a ghost player 2 hooked was pulled against player 1's nozzle (the tsuri
+strategies, e.g. `fn_800CDCF4`). With the improvements:
+- a ghost being hooked (message 9) deals with the player whose suction hooked it;
+- any object (ghosts included, not Luigi and his parts) deals with the player whose running
+  Poltergust points at it while the player it deals with does not (`retargetObjects`, every frame);
+- an object that deals with player 2 runs its update (`EnZako::vt_0C`, 0x800C1EBC) as player 2:
+  player index 0 reads as 1 (`fn_800AC164`, `fn_800E9750`), and in the split screen view 0 reads
+  as view 1 for its room-visible tests (`fn_8001CEAC`). Not verified yet (2-player work paused):
+  meant to let player 2 catch Bogmire's shadows; the test run was stopped before it got there.
+  `LM_COOP_BISECT=100` turns it off.
+
+**Objects pulled to the nozzle.** `fn_80143174` (hearts and other items, Boolossus' frozen Boos,
+...) tests player 1's suction only: `fn_80144664` asks for player 0's Poltergust, `fn_8014405C` for
+the room in view 0, and the suction state's nozzle record (0x803D8B40 +0xE0, filled each frame by
+`fn_80145534` -> `fn_8012BF4C`) is player 1's. With the improvements a second record is filled for
+player 2 each frame, and the test runs as player 2 (with that record) while player 2's Poltergust
+points at the object and player 1's does not; the pulled object's update (`fn_800C60B0`) then
+follows player 2's nozzle until it is swallowed (message 4, capture). The test has side effects (a
+failed test lets go of the object), so it runs once, for one player.
+
 **Interpolation.** Views pair by their view index (tags.cpp `fn_8000BB98`), so the two halves never
 pair with each other; a change between one and two views is a camera cut (the view count changes).
 120 fps at 16:9 (`LM_JUDDER_LOG`, split and shared, both players and the camera moving): 0

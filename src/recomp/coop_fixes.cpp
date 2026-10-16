@@ -49,6 +49,7 @@ u32 sLastRoom[2] = {~0u, ~0u};
 // message 3 (capture end) removes them.
 std::vector<u32> sGhosts;
 std::vector<u32> sObjects;  // AI objects of non-ghost characters that got a message this map
+int sAsPlayer2 = 0;  // > 0: game code runs as player 2 (player index 0 reads as 1; below)
 std::vector<std::pair<u32, u32>> sPulledByP2;  // objects player 2's suction pulls: zako, game frame
 void retargetObjects(Ctx& c);  // below
 
@@ -117,7 +118,10 @@ void bringP2(Ctx&, u32 p1, u32 p2) {
 
 u32 player(Ctx& c, int idx) {
     if (!active() && idx > 0) return 0;
+    const int as2 = sAsPlayer2;
+    sAsPlayer2 = 0;  // the real player idx, also while game code runs as player 2
     const u32 p = gu::call(c, GU_SYM("fn_800E9750__Q24Koga9EnManagerFl"), {u32(idx)});
+    sAsPlayer2 = as2;
     return gu::inMem1(p) ? p : 0;
 }
 
@@ -702,7 +706,6 @@ void retargetObjects(Ctx& c) {
 namespace {
 #define kSuction VA(0x803D8B40)  // suction state (fn_8014588C sets +0xE0 -> +0x00, +0xE4 -> +0x60)
 u32 sP2Nozzle = 0;               // player 2's copy of its +0x00 nozzle record (HLE memory)
-int sAsPlayer2 = 0;  // > 0: running as player 2 (player index 0 reads as 1)
 bool pulledByP2(u32 zako) {
     const u32 now = skip::guestFrames();
     for (const auto& [z, f] : sPulledByP2)
@@ -770,6 +773,26 @@ HLE(fn_80145534) {
     sAsPlayer2++;
     gu::call(c, VA(0x8012BF4C), {sP2Nozzle}, {double(gu::rdf(c.r[2] - 0x51F0))});
     sAsPlayer2--;
+}
+
+// An AI object's per-frame update (EnZako::vt_0C, 0x800C1EBC(thought): its strategy's update, then its light).
+// Much object code asks for player 0 literally (fn_800AD39C(0), fn_800E9750(0), fn_800AD54C(0, ..)):
+// Bogmire's shadows are caught on player 1's nozzle only (fn_8006E47C, fn_8006EA10, ...). An object
+// that deals with player 2 (+0x950 = 1: player 2's Poltergust caught or hooked it, above) runs its
+// update as player 2. Not Luigi and his own parts (types up to 10).
+HLE(vt_0C__6EnZakoFv) {
+    const u32 t = c.r[3];
+    const u32 a = gu::inMem1(t) ? rd32(t + 0x808) : 0;
+    const bool p2 = fixes() && !off(0x100) && gu::inMem1(a) && rd32(a + 0x3C) > 10 && rd32(t + 0x950) == 1;
+    if (p2) sAsPlayer2++;
+    callOriginal(c, "vt_0C__6EnZakoFv");
+    if (p2) sAsPlayer2--;
+}
+
+// EnManager player by index (fn_800E9750): index 0 reads as 1 while running as player 2.
+HLE(fn_800E9750__Q24Koga9EnManagerFl) {
+    if (sAsPlayer2 > 0 && c.r[3] == 0) c.r[3] = 1;
+    callOriginal(c, "fn_800E9750__Q24Koga9EnManagerFl");
 }
 
 // Player by index (index < 256: fn_800E9750; else the special object r13+0xCC8).

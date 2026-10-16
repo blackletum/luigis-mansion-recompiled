@@ -248,6 +248,8 @@ fn_80143174
 fn_80145534
 fn_800C60B0
 fn_800AC164
+vt_0C__6EnZakoFv
+fn_800E9750__Q24Koga9EnManagerFl
 fn_8001CEAC
 
 # Enhanced lighting (src/recomp/enhanced_lighting.cpp, docs/RENDERING.md): the main 3D view of the
